@@ -16,8 +16,13 @@ set -euo pipefail
 INWARD_LAYERS=(app/core app/common app/infrastructure)
 
 # Anchored to the start of a line (allowing indentation) so it matches real
-# import statements only. Prose in a docstring that mentions `app.modules`, and
-# a commented-out example, are not dependencies.
+# import statements only. Prose mentioning `app.modules`, and a commented-out
+# example, are not dependencies.
+#
+# This is a textual scan, so it cannot tell code from a docstring: a doc example
+# whose line begins with `from app.modules...` trips it. Write such examples as
+# prose instead. Parsing the AST would fix this properly and is not worth the
+# complexity for a guard that must stay obvious enough to trust.
 IMPORT_PATTERN='^[[:space:]]*(from|import)[[:space:]]+app\.modules'
 
 if violations=$(grep -rnE --include='*.py' "$IMPORT_PATTERN" \

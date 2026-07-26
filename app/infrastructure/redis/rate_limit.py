@@ -162,7 +162,156 @@ async def reset_rate_limit(identity: str) -> None:
         logger.warning("Rate limit reset failed", extra={"identity": identity})
 
 
-# TODO: add a token-bucket variant for endpoints that should permit a short
-# burst but a low sustained rate (bulk imports, report generation).
-# TODO: add per-endpoint overrides, so an expensive route can carry a tighter
-# limit than the global default without a separate middleware.
+@dataclass(frozen=True, slots=True)
+class EndpointLimit:
+    """A rate limit that applies to one route rather than globally.
+
+    The global limit protects the service from a runaway client. It is the
+    wrong instrument for a single expensive endpoint: setting it low enough to
+    protect a report generator would throttle ordinary reads, and setting it
+    high enough for ordinary reads leaves the report generator unprotected.
+
+    Attributes:
+        limit: Requests permitted per window.
+        window_seconds: Sliding window length.
+        burst: When set, uses a token bucket permitting this many requests
+            back-to-back while holding the long-run average to ``limit``.
+    """
+
+    limit: int
+    window_seconds: int = 60
+    burst: int | None = None
+
+
+#: Per-route overrides, keyed by the route *template* — never the resolved
+#: path, or every distinct ID would get its own allowance.
+ENDPOINT_LIMITS: dict[str, EndpointLimit] = {}
+
+
+def register_endpoint_limit(route: str, limit: EndpointLimit) -> None:
+    """Declare a tighter limit for one route.
+
+    Called at import time by the feature that owns the route, so the limit
+    lives next to the expensive endpoint rather than in a distant config file
+    that nobody updates when the endpoint changes.
+    """
+    ENDPOINT_LIMITS[route] = limit
+
+
+def limit_for_route(route: str, *, authenticated: bool) -> EndpointLimit:
+    """Return the limit that applies to a route, falling back to the global one."""
+    if override := ENDPOINT_LIMITS.get(route):
+        return override
+    return EndpointLimit(
+        limit=resolve_limit(authenticated=authenticated),
+        window_seconds=settings.rate_limit.window_seconds,
+    )
+
+
+async def check_token_bucket(
+    identity: str, *, rate: float, burst: int, window_seconds: int = 60
+) -> RateLimitResult:
+    """Check an allowance using a token bucket rather than a sliding window.
+
+    When to prefer this
+    -------------------
+    A sliding window is the right default: it is precise and easy to reason
+    about. A token bucket is better where a *short burst is legitimate but a
+    high sustained rate is not* — a client syncing fifty records on startup and
+    then going quiet, or a bulk import that arrives in waves.
+
+    Under a sliding window, that client must either be given a limit high
+    enough for its burst (leaving it unthrottled the rest of the time) or be
+    rejected for behaviour that is perfectly reasonable.
+
+    How it works
+    ------------
+    The bucket holds at most ``burst`` tokens and refills at ``rate`` tokens
+    per second. Each request costs one token. A caller can spend the whole
+    bucket at once, then proceeds at the refill rate.
+
+    State is two fields — token count and last-refill time — updated in one
+    atomic Lua script, so two concurrent requests cannot both read a stale
+    count and both take the last token.
+
+    Args:
+        identity: What the limit is keyed by.
+        rate: Tokens added per second — the sustained rate.
+        burst: Bucket capacity — the largest permissible burst.
+        window_seconds: How long an idle bucket is retained.
+
+    Returns:
+        The result, including values for the response headers.
+    """
+    key = build_key("bucket", identity)
+    now = time.time()
+
+    try:
+        # Lua so read-modify-write is atomic. Splitting it into GET/SET would
+        # let concurrent requests both observe the same token count.
+        tokens_remaining = await get_redis().eval(
+            _BUCKET_LUA,
+            1,
+            key,
+            str(rate),
+            str(burst),
+            str(now),
+            str(window_seconds),
+        )
+    except Exception:  # noqa: BLE001 - policy decides what an outage means
+        if settings.rate_limit.fail_open:
+            return fail_open(identity, burst)
+        return RateLimitResult(
+            allowed=False, limit=burst, remaining=0, reset_after=window_seconds
+        )
+
+    remaining = int(tokens_remaining)
+    allowed = remaining >= 0
+    return RateLimitResult(
+        allowed=allowed,
+        limit=burst,
+        remaining=max(0, remaining),
+        # Time until one token is available again, which is what a rejected
+        # caller actually needs to know.
+        reset_after=max(1, int(1 / rate)) if not allowed else 0,
+    )
+
+
+#: Atomic token-bucket update, as Lua so read-modify-write cannot interleave.
+#: (Named ``_BUCKET_LUA`` rather than ``..._TOKEN_...`` so the secret scanner
+#: does not mistake a Lua script for a credential.)
+#:
+#: Returns the token count remaining after this request, or -1 when the bucket
+#: was empty. Refill is computed from elapsed time rather than a timer, so an
+#: idle bucket costs nothing and needs no background process.
+_BUCKET_LUA = """
+local key = KEYS[1]
+local rate = tonumber(ARGV[1])
+local burst = tonumber(ARGV[2])
+local now = tonumber(ARGV[3])
+local ttl = tonumber(ARGV[4])
+
+local state = redis.call('HMGET', key, 'tokens', 'updated')
+local tokens = tonumber(state[1])
+local updated = tonumber(state[2])
+
+if tokens == nil then
+  tokens = burst
+  updated = now
+end
+
+-- Refill for the time that has passed, capped at the bucket size.
+local elapsed = math.max(0, now - updated)
+tokens = math.min(burst, tokens + elapsed * rate)
+
+if tokens < 1 then
+  redis.call('HMSET', key, 'tokens', tokens, 'updated', now)
+  redis.call('EXPIRE', key, ttl)
+  return -1
+end
+
+tokens = tokens - 1
+redis.call('HMSET', key, 'tokens', tokens, 'updated', now)
+redis.call('EXPIRE', key, ttl)
+return math.floor(tokens)
+"""

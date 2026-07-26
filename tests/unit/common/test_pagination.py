@@ -110,3 +110,100 @@ class TestSortSafety:
 
     def test_default_order_is_descending(self) -> None:
         assert SortParams().order is SortOrder.DESC
+
+
+class TestCursorEncoding:
+    SECRET = "test-signing-secret"
+
+    def test_round_trip(self) -> None:
+        from app.common.pagination import decode_cursor, encode_cursor
+
+        values = {"created_at": "2026-01-15T10:30:00+00:00", "id": "0193f4a2"}
+        cursor = encode_cursor(values, secret=self.SECRET)
+        assert decode_cursor(cursor, secret=self.SECRET) == values
+
+    def test_cursor_is_opaque(self) -> None:
+        """A client that can read a cursor will come to depend on its shape."""
+        from app.common.pagination import encode_cursor
+
+        cursor = encode_cursor({"id": "secret-value"}, secret=self.SECRET)
+        assert "secret-value" not in cursor
+        assert "created_at" not in cursor
+
+    def test_url_safe(self) -> None:
+        from app.common.pagination import encode_cursor
+
+        cursor = encode_cursor({"id": "a" * 50}, secret=self.SECRET)
+        assert "+" not in cursor
+        assert "/" not in cursor
+        assert "=" not in cursor
+
+    def test_tampered_cursor_is_rejected(self) -> None:
+        import base64
+        import json
+
+        from app.common.pagination import decode_cursor
+        from app.core.exceptions import ValidationError
+
+        forged = (
+            base64.urlsafe_b64encode(
+                json.dumps({"v": 1, "k": {"id": "anything"}}).encode() + b".fakesig"
+            )
+            .decode()
+            .rstrip("=")
+        )
+        with pytest.raises(ValidationError):
+            decode_cursor(forged, secret=self.SECRET)
+
+    def test_wrong_secret_is_rejected(self) -> None:
+        from app.common.pagination import decode_cursor, encode_cursor
+        from app.core.exceptions import ValidationError
+
+        cursor = encode_cursor({"id": "1"}, secret=self.SECRET)
+        with pytest.raises(ValidationError):
+            decode_cursor(cursor, secret="different-secret")
+
+    def test_garbage_is_rejected(self) -> None:
+        from app.common.pagination import decode_cursor
+        from app.core.exceptions import ValidationError
+
+        with pytest.raises(ValidationError):
+            decode_cursor("!!!not-base64!!!", secret=self.SECRET)
+
+    def test_stale_version_is_rejected(self) -> None:
+        """A cursor minted before a sort change must fail, not page wrongly."""
+        import base64
+        import hashlib
+        import hmac
+        import json
+
+        from app.common.pagination import decode_cursor
+        from app.core.exceptions import ValidationError
+
+        payload = json.dumps(
+            {"v": 999, "k": {"id": "1"}}, separators=(",", ":"), sort_keys=True
+        ).encode()
+        signature = hmac.new(self.SECRET.encode(), payload, hashlib.sha256).digest()[
+            :16
+        ]
+        cursor = (
+            base64.urlsafe_b64encode(payload + b"." + signature).decode().rstrip("=")
+        )
+        with pytest.raises(ValidationError):
+            decode_cursor(cursor, secret=self.SECRET)
+
+    def test_error_does_not_reveal_the_failure_mode(self) -> None:
+        """Distinguishing bad-signature from bad-base64 lets a client probe."""
+        from app.common.pagination import decode_cursor
+        from app.core.exceptions import ValidationError
+
+        with pytest.raises(ValidationError) as garbage:
+            decode_cursor("!!!", secret=self.SECRET)
+        with pytest.raises(ValidationError) as wrong_secret:
+            decode_cursor(
+                __import__(
+                    "app.common.pagination", fromlist=["encode_cursor"]
+                ).encode_cursor({"id": "1"}, secret="other"),
+                secret=self.SECRET,
+            )
+        assert garbage.value.code == wrong_secret.value.code

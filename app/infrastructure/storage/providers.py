@@ -19,7 +19,7 @@ import shutil
 from collections.abc import AsyncIterator
 from datetime import timedelta
 from pathlib import Path
-from typing import Any
+from typing import IO, Any
 
 from app.common.constants import STREAM_CHUNK_SIZE
 from app.common.utils.crypto import sign_payload
@@ -28,9 +28,31 @@ from app.common.utils.files import safe_join
 from app.core.config import settings
 from app.core.exceptions import ExternalServiceError, NotFoundError
 from app.core.logging import get_logger
-from app.infrastructure.storage.client import StoredObject
+from app.infrastructure.storage.client import (
+    MIN_PART_SIZE,
+    MultipartUpload,
+    StoredObject,
+)
 
 logger = get_logger(__name__)
+
+#: Used when a stored object has no recorded content type.
+_DEFAULT_CONTENT_TYPE = "application/octet-stream"
+
+
+def _open_read(path: Path) -> IO[bytes]:
+    """Open for binary reading, with a type the checker can follow."""
+    return path.open("rb")
+
+
+def _open_write(path: Path) -> IO[bytes]:
+    """Open for binary writing, with a type the checker can follow."""
+    return path.open("wb")
+
+
+def _unlink(path: Path) -> None:
+    """Delete a file, tolerating one that is already gone."""
+    path.unlink(missing_ok=True)
 
 
 class LocalStorageProvider:
@@ -86,7 +108,7 @@ class LocalStorageProvider:
     async def _write_stream(self, path: Path, data: AsyncIterator[bytes]) -> int:
         """Stream to disk without holding the whole object in memory."""
         size = 0
-        handle = await asyncio.to_thread(path.open, "wb")
+        handle = await asyncio.to_thread(_open_write, path)
         try:
             async for block in data:
                 await asyncio.to_thread(handle.write, block)
@@ -101,7 +123,7 @@ class LocalStorageProvider:
         if not await asyncio.to_thread(path.is_file):
             raise NotFoundError(f"No stored object for key: {key}")
 
-        handle = await asyncio.to_thread(path.open, "rb")
+        handle = await asyncio.to_thread(_open_read, path)
         try:
             while block := await asyncio.to_thread(handle.read, STREAM_CHUNK_SIZE):
                 yield block
@@ -111,8 +133,8 @@ class LocalStorageProvider:
     async def delete(self, key: str) -> None:
         """Unlink the file, ignoring a missing path."""
         path = self._path(key)
-        await asyncio.to_thread(path.unlink, True)
-        await asyncio.to_thread(path.with_suffix(path.suffix + ".meta").unlink, True)
+        await asyncio.to_thread(_unlink, path)
+        await asyncio.to_thread(_unlink, path.with_suffix(path.suffix + ".meta"))
 
     async def exists(self, key: str) -> bool:
         """Whether the path exists beneath the root."""
@@ -141,14 +163,52 @@ class LocalStorageProvider:
         """Verify a signature produced by :meth:`presigned_url`."""
         if expires < int(utc_now().timestamp()):
             return False
-        expected = sign_payload(
-            f"{key}:{expires}".encode(), settings.redis.key_prefix
-        )
+        expected = sign_payload(f"{key}:{expires}".encode(), settings.redis.key_prefix)
         return hmac.compare_digest(expected, signature)
+
+    async def copy(self, source_key: str, destination_key: str) -> StoredObject:
+        """Copy a file within the root.
+
+        The "promote from a temp prefix" flow: an upload lands under
+        ``tmp/<id>`` while it is being validated, then moves to its permanent
+        key once accepted. Uploading straight to the final key means a rejected
+        file has already occupied the name a valid one needs.
+        """
+        source = self._path(source_key)
+        if not await asyncio.to_thread(source.is_file):
+            raise NotFoundError(f"No stored object for key: {source_key}")
+
+        destination = self._path(destination_key)
+        await asyncio.to_thread(destination.parent.mkdir, parents=True, exist_ok=True)
+        await asyncio.to_thread(shutil.copy2, source, destination)
+
+        metadata = source.with_suffix(source.suffix + ".meta")
+        content_type = _DEFAULT_CONTENT_TYPE
+        if await asyncio.to_thread(metadata.is_file):
+            content_type = await asyncio.to_thread(metadata.read_text)
+            await asyncio.to_thread(
+                destination.with_suffix(destination.suffix + ".meta").write_text,
+                content_type,
+            )
+
+        size = await asyncio.to_thread(lambda: destination.stat().st_size)
+        return StoredObject(key=destination_key, size=size, content_type=content_type)
+
+    async def move(self, source_key: str, destination_key: str) -> StoredObject:
+        """Move a file, deleting the source only after the copy succeeds.
+
+        Copy-then-delete rather than a rename: a rename cannot cross
+        filesystems, and this provider's root may well be a mount. The ordering
+        matters — a failed copy leaves the source intact, whereas
+        delete-then-copy would lose the object outright.
+        """
+        stored = await self.copy(source_key, destination_key)
+        await self.delete(source_key)
+        return stored
 
     async def clear(self) -> None:
         """Remove everything beneath the root. For test teardown only."""
-        await asyncio.to_thread(shutil.rmtree, self._root, True)
+        await asyncio.to_thread(shutil.rmtree, self._root, ignore_errors=True)
 
 
 class S3StorageProvider:
@@ -170,7 +230,10 @@ class S3StorageProvider:
 
     def _client(self) -> Any:
         """Build a configured S3 client context manager."""
-        import aioboto3
+        # Deferred deliberately: importing botocore costs roughly a second,
+        # which every process would pay even when the local provider is in
+        # use. Only an S3-configured deployment should bear it.
+        import aioboto3  # noqa: PLC0415 - heavy import, deferred on purpose
 
         session = aioboto3.Session()
         return session.client(
@@ -264,6 +327,165 @@ class S3StorageProvider:
                 )
         except Exception as exc:
             raise ExternalServiceError("Could not sign a storage URL") from exc
+
+    async def copy(self, source_key: str, destination_key: str) -> StoredObject:
+        """Copy an object server-side.
+
+        The bytes never travel through this process: S3 copies within the
+        bucket itself. Downloading and re-uploading would be slower, cost
+        egress, and hold a worker for the duration.
+        """
+        try:
+            async with self._client() as client:
+                await client.copy_object(
+                    Bucket=self._bucket,
+                    Key=destination_key,
+                    CopySource={"Bucket": self._bucket, "Key": source_key},
+                )
+                head = await client.head_object(
+                    Bucket=self._bucket, Key=destination_key
+                )
+        except Exception as exc:
+            raise ExternalServiceError("Object storage copy failed") from exc
+
+        return StoredObject(
+            key=destination_key,
+            size=head.get("ContentLength", 0),
+            content_type=head.get("ContentType", _DEFAULT_CONTENT_TYPE),
+            etag=head.get("ETag", "").strip('"') or None,
+        )
+
+    async def move(self, source_key: str, destination_key: str) -> StoredObject:
+        """Move an object, deleting the source once the copy succeeds.
+
+        S3 has no atomic move. Copy first, then delete: if the delete fails the
+        result is a duplicate, which a lifecycle rule can clean up. The reverse
+        order risks losing the object entirely.
+        """
+        stored = await self.copy(source_key, destination_key)
+        await self.delete(source_key)
+        return stored
+
+    async def begin_multipart(self, key: str, *, content_type: str) -> MultipartUpload:
+        """Start a multipart upload.
+
+        The returned ``upload_id`` must be kept until the upload is completed
+        or aborted — losing it strands the parts, which continue to be billed
+        and do not appear in a normal bucket listing.
+        """
+        try:
+            async with self._client() as client:
+                response = await client.create_multipart_upload(
+                    Bucket=self._bucket, Key=key, ContentType=content_type
+                )
+        except Exception as exc:
+            raise ExternalServiceError("Could not start a multipart upload") from exc
+
+        return MultipartUpload(key=key, upload_id=response["UploadId"])
+
+    async def upload_part(
+        self, upload: MultipartUpload, part_number: int, data: bytes
+    ) -> MultipartUpload:
+        """Upload one part and record its ETag.
+
+        Every part except the last must be at least ``MIN_PART_SIZE``. Checked
+        here rather than left to S3, which only reports the violation at
+        completion — after every other part has been uploaded and paid for.
+
+        Returns:
+            A new :class:`MultipartUpload` with the part recorded. The value is
+            frozen, so the caller must use the returned object.
+
+        Raises:
+            ValueError: When the part is undersized or the number is out of
+                sequence.
+        """
+        if part_number != len(upload.parts) + 1:
+            raise ValueError(
+                f"Parts must be contiguous from 1; expected "
+                f"{len(upload.parts) + 1}, got {part_number}"
+            )
+        if len(data) < MIN_PART_SIZE:
+            logger.warning(
+                "Multipart part is below the S3 minimum; it must be the last one",
+                extra={"part_number": part_number, "size": len(data)},
+            )
+
+        try:
+            async with self._client() as client:
+                response = await client.upload_part(
+                    Bucket=self._bucket,
+                    Key=upload.key,
+                    UploadId=upload.upload_id,
+                    PartNumber=part_number,
+                    Body=data,
+                )
+        except Exception as exc:
+            raise ExternalServiceError("Multipart part upload failed") from exc
+
+        return MultipartUpload(
+            key=upload.key,
+            upload_id=upload.upload_id,
+            parts=[*upload.parts, (part_number, response["ETag"])],
+        )
+
+    async def complete_multipart(self, upload: MultipartUpload) -> StoredObject:
+        """Assemble the uploaded parts into the final object.
+
+        Raises:
+            ValueError: When no parts were uploaded — completing an empty
+                upload produces a confusing provider error rather than an
+                obvious one.
+        """
+        if not upload.parts:
+            raise ValueError("Cannot complete a multipart upload with no parts")
+
+        try:
+            async with self._client() as client:
+                await client.complete_multipart_upload(
+                    Bucket=self._bucket,
+                    Key=upload.key,
+                    UploadId=upload.upload_id,
+                    MultipartUpload={
+                        "Parts": [
+                            {"PartNumber": number, "ETag": etag}
+                            for number, etag in upload.parts
+                        ]
+                    },
+                )
+                head = await client.head_object(Bucket=self._bucket, Key=upload.key)
+        except Exception as exc:
+            # Abort so the parts stop accruing storage charges. Best-effort:
+            # the completion failure is the one worth reporting.
+            await self.abort_multipart(upload)
+            raise ExternalServiceError(
+                "Could not complete the multipart upload"
+            ) from exc
+
+        return StoredObject(
+            key=upload.key,
+            size=head.get("ContentLength", 0),
+            content_type=head.get("ContentType", _DEFAULT_CONTENT_TYPE),
+            etag=head.get("ETag", "").strip('"') or None,
+        )
+
+    async def abort_multipart(self, upload: MultipartUpload) -> None:
+        """Discard an incomplete upload.
+
+        Never raises. It is called from failure paths, where masking the
+        original error with a cleanup error helps nobody — the abort is logged
+        and a lifecycle rule is the backstop.
+        """
+        try:
+            async with self._client() as client:
+                await client.abort_multipart_upload(
+                    Bucket=self._bucket, Key=upload.key, UploadId=upload.upload_id
+                )
+        except Exception:  # noqa: BLE001 - cleanup must not mask the real error
+            logger.warning(
+                "Could not abort a multipart upload; parts may still be billed",
+                extra={"key": upload.key, "upload_id": upload.upload_id},
+            )
 
 
 async def _collect(data: AsyncIterator[bytes]) -> bytes:

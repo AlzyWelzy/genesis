@@ -29,11 +29,12 @@ from pathlib import Path
 # as a module, which is what a container CMD and a developer both reach for.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from app.core.config import settings  # noqa: E402
-from app.core.logging import configure_logging, get_logger  # noqa: E402
-from app.infrastructure.queue.client import tasks  # noqa: E402
-from app.infrastructure.queue.worker import Worker  # noqa: E402
-from app.infrastructure.redis.client import close_redis, init_redis  # noqa: E402
+from app.core.config import settings
+from app.core.discovery import import_side_effect_modules
+from app.core.logging import configure_logging, get_logger
+from app.infrastructure.queue.client import tasks
+from app.infrastructure.queue.worker import Worker
+from app.infrastructure.redis.client import close_redis, init_redis
 
 logger = get_logger("worker")
 
@@ -42,11 +43,16 @@ def load_task_modules() -> None:
     """Import every module that registers task handlers.
 
     Handlers register via a decorator, which only runs on import. A worker that
-    has not imported a task module will reject its jobs as unknown and
-    dead-letter them — so this import list is load-bearing, exactly like the
-    model imports in ``migrations/env.py``.
+    has not imported a task module rejects its jobs as unknown and dead-letters
+    them — silently losing work that the producer believes was accepted.
+
+    Discovery removes the hand-maintained list; see :mod:`app.core.discovery`.
     """
-    # TODO: import each app.modules.<feature>.tasks module as features are added.
+    loaded = import_side_effect_modules()
+    logger.info(
+        "Task modules loaded",
+        extra={"features": {name: list(subs) for name, subs in loaded.items()}},
+    )
 
 
 async def run(name: str, concurrency: int) -> None:

@@ -9,6 +9,7 @@ from it.
 
 | Document | Answers |
 | --- | --- |
+| [`module-reference.md`](module-reference.md) | File-by-file account of every module: what it does, the decision it encodes, the failure it prevents |
 | [`project-structure.md`](project-structure.md) | Where does this code go? |
 | [`dependency-rules.md`](dependency-rules.md) | What may import what? |
 | [`request-lifecycle.md`](request-lifecycle.md) | What happens to a request, in order? |

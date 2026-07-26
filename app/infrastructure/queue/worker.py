@@ -26,7 +26,7 @@ Run it with ``uv run python scripts/worker.py``.
 
 import asyncio
 import json
-from typing import Any
+from typing import Any, cast
 
 from redis.exceptions import ResponseError
 
@@ -52,6 +52,12 @@ _BACKOFF_MAX_SECONDS = 3600
 
 #: A message pending longer than this is presumed abandoned by a dead worker.
 _STALLED_AFTER_MS = 300_000
+
+#: Shape of an ``XREADGROUP`` reply: one entry per stream, each holding a
+#: list of ``(message_id, fields)`` pairs. redis-py types the whole reply as
+#: ``Any``, so declaring it here documents the contract in one place instead
+#: of forcing every consumer to re-derive it.
+type StreamReply = list[tuple[Any, list[tuple[Any, dict[Any, Any]]]]]
 
 
 class Worker:
@@ -120,7 +126,7 @@ class Worker:
                 await self._consume_batch()
             except asyncio.CancelledError:
                 raise
-            except Exception:  # noqa: BLE001 - the loop must survive anything
+            except Exception:
                 logger.exception("Worker loop error; continuing")
                 await asyncio.sleep(1)
 
@@ -148,8 +154,9 @@ class Worker:
             # Remove first: if the process dies between the two operations, a
             # duplicate delivery is recoverable (handlers are idempotent) while
             # a lost job is not.
-            if await client.zrem(key, raw):
-                await client.xadd(build_key(STREAM_KEY), json.loads(raw))
+            entry = _text(raw)
+            if await client.zrem(key, entry):
+                await client.xadd(build_key(STREAM_KEY), json.loads(entry))
                 promoted += 1
         return promoted
 
@@ -184,12 +191,15 @@ class Worker:
     async def _consume_batch(self) -> None:
         """Read and process one batch of new messages."""
         client = get_redis()
-        response = await client.xreadgroup(
-            CONSUMER_GROUP,
-            self.name,
-            {build_key(STREAM_KEY): ">"},
-            count=self.concurrency,
-            block=5000,  # ms; an idle worker blocks rather than spinning
+        response = cast(
+            StreamReply,
+            await client.xreadgroup(
+                CONSUMER_GROUP,
+                self.name,
+                {build_key(STREAM_KEY): ">"},
+                count=self.concurrency,
+                block=5000,  # ms; an idle worker blocks rather than spinning
+            ),
         )
         if not response:
             return
@@ -213,7 +223,9 @@ class Worker:
             handler = self.registry.resolve(job.name)
         except KeyError:
             # An unregistered task can never succeed, so retrying is pointless.
-            logger.error("Unknown task; dead-lettering", extra={"job_name": job.name})
+            logger.exception(
+                "Unknown task; dead-lettering", extra={"job_name": job.name}
+            )
             await self._dead_letter(job, reason="unknown_task")
             await client.xack(build_key(STREAM_KEY), CONSUMER_GROUP, job.message_id)
             return

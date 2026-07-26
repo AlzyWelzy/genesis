@@ -58,9 +58,18 @@ class Base(DeclarativeBase):
         return f"<{type(self).__name__} {pk}>"
 
 
-# TODO: decide the default primary key strategy (UUIDv7 vs bigint identity) and
-# encode it in a mixin rather than repeating it per model.
-# TODO: if soft deletion is adopted, document that queries must go through the
-# repository layer, which applies the `deleted_at IS NULL` filter.
+# Decisions already encoded elsewhere, recorded here so a reader of this file
+# does not have to go looking:
+#
+# * Primary keys are UUIDv7, supplied by `UUIDPrimaryKeyMixin` in mixins.py.
+#   Time-ordered, so inserts keep index locality, without a sequential key's
+#   enumerability.
+# * Tenancy is row-level `tenant_id`, supplied by `TenantMixin` and *enforced*
+#   by `TenantRepository`, which scopes every query it builds.
+# * Soft deletion is opt-in per model via `SoftDeleteMixin`, and the
+#   `deleted_at IS NULL` filter is applied by `SoftDeleteRepositoryMixin` —
+#   never by individual call sites, which is where it would be forgotten.
+#
+# See docs/architecture/database-conventions.md.
 
 __all__ = ["Base"]

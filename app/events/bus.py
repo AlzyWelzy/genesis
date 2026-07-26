@@ -33,11 +33,28 @@ import asyncio
 import inspect
 from collections import defaultdict
 from collections.abc import Awaitable, Callable
+from typing import TYPE_CHECKING, Final
 
 from app.core.logging import get_logger
 from app.events.base import DomainEvent
 
+if TYPE_CHECKING:
+    from sqlalchemy.ext.asyncio import AsyncSession
+
 logger = get_logger(__name__)
+
+#: Key under which buffered events live in ``session.info``.
+_PENDING_EVENTS_KEY: Final[str] = "genesis.pending_events"
+
+
+def _describe(handler: object) -> str:
+    """Name a handler for logs.
+
+    ``Callable`` carries no ``__qualname__`` in the type system even though
+    every real function has one, so read it defensively.
+    """
+    return getattr(handler, "__qualname__", repr(handler))
+
 
 #: A subscriber. Returns nothing; raising is logged and swallowed by the bus.
 type EventHandler[E: DomainEvent] = Callable[[E], Awaitable[None]]
@@ -76,13 +93,11 @@ class EventBus:
         def decorator(handler: EventHandler[E]) -> EventHandler[E]:
             if not inspect.iscoroutinefunction(handler):
                 raise TypeError(
-                    f"Event handler {handler.__qualname__} must be async; a "
+                    f"Event handler {_describe(handler)} must be async; a "
                     "synchronous handler blocks the event loop for every publisher."
                 )
             self._handlers[event_type].append(handler)  # ty: ignore[invalid-argument-type]
-            logger.debug(
-                "Subscribed %s to %s", handler.__qualname__, event_type.__name__
-            )
+            logger.debug("Subscribed %s to %s", _describe(handler), event_type.__name__)
             return handler
 
         return decorator
@@ -133,7 +148,7 @@ class EventBus:
                     extra={
                         "event_name": event.name,
                         "event_id": str(event.event_id),
-                        "handler": handler.__qualname__,
+                        "handler": _describe(handler),
                     },
                 )
 
@@ -169,6 +184,75 @@ class EventBus:
 #: Process-wide bus. Import this rather than constructing another.
 event_bus = EventBus()
 
-# TODO: implement a transactional outbox — write events to a table inside the
-# business transaction and publish them from a relay — once losing an event on
-# a crash between commit and publish becomes unacceptable.
+
+async def publish_after_commit(
+    session: AsyncSession, *events: DomainEvent, durable: bool = False
+) -> None:
+    """Publish events once the caller's transaction commits.
+
+    Solves the ordering problem that makes naive publishing wrong: a handler
+    that reads the row an event refers to will not find it if the transaction
+    has not committed yet, and publishing *before* the commit means a rollback
+    leaves subscribers reacting to something that never happened.
+
+    Two modes, and the choice is a real one:
+
+    **``durable=False``** (default) stages the events on the session and
+    publishes them in-process after the commit succeeds. Cheap, and the
+    ordering is correct — but a crash in the window between commit and publish
+    loses them.
+
+    **``durable=True``** writes the events to the outbox *inside* the
+    transaction, so they commit atomically with the business change and a relay
+    publishes them afterwards. Costs one insert per event and requires the relay
+    to be running. Use it for anything whose loss a customer would notice —
+    payments, receipts, provisioning — and leave it off for cache invalidation,
+    where the next write republishes anyway.
+
+    Args:
+        session: The session running the business transaction.
+        *events: Events to publish.
+        durable: Route through the transactional outbox.
+    """
+    if durable:
+        # Deferred: outbox.relay imports events.base, so a top-level import
+        # here would close a cycle. The durable path is the rarer one, so
+        # paying an import lookup on it is the right trade.
+        from app.infrastructure.outbox.relay import (  # noqa: PLC0415
+            stage_many,
+        )
+
+        await stage_many(session, list(events))
+        return
+
+    _pending_events(session).extend(events)
+
+
+def _pending_events(session: AsyncSession) -> list[DomainEvent]:
+    """Return the event buffer attached to a session, creating it on demand.
+
+    Stored in ``session.info``, SQLAlchemy's per-session scratch space, so the
+    buffer's lifetime is exactly the session's and two concurrent requests
+    cannot see each other's events.
+    """
+    return session.info.setdefault(_PENDING_EVENTS_KEY, [])
+
+
+async def flush_pending_events(session: AsyncSession) -> int:
+    """Publish the events buffered on a session, after its commit.
+
+    Call this immediately after ``session.commit()``. Buffered events are
+    cleared before publication, so a handler that raises cannot cause the same
+    event to be published twice on a later flush.
+
+    Returns:
+        How many events were published.
+    """
+    pending = _pending_events(session)
+    if not pending:
+        return 0
+
+    events = list(pending)
+    pending.clear()
+    await event_bus.publish_many(events)
+    return len(events)

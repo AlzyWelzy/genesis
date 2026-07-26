@@ -48,6 +48,17 @@ from app.infrastructure.redis.client import build_key, get_redis
 
 logger = get_logger(__name__)
 
+
+def _as_text(value: object) -> str:
+    """Coerce a Redis response value to text.
+
+    redis-py types its responses as ``Any``, so values arrive as bytes
+    or str depending on the client's decode setting. Normalising here
+    keeps every caller from re-deciding.
+    """
+    return value.decode() if isinstance(value, bytes) else str(value)
+
+
 #: Stream every job is written to.
 STREAM_KEY = "jobs"
 
@@ -160,7 +171,10 @@ class RedisQueue:
             if not claimed:
                 logger.info(
                     "Duplicate job suppressed",
-                    extra={"job_name": job.name, "idempotency_key": job.idempotency_key},
+                    extra={
+                        "job_name": job.name,
+                        "idempotency_key": job.idempotency_key,
+                    },
                 )
                 return job_id
 
@@ -171,7 +185,11 @@ class RedisQueue:
                 {json.dumps(job.encode(job_id)): due},
             )
         else:
-            await client.xadd(build_key(STREAM_KEY), job.encode(job_id))
+            # redis-py's stubs type stream fields more narrowly than the
+            # client actually accepts; a dict[str, str] is valid at runtime.
+            await client.xadd(  # ty: ignore[no-matching-overload]
+                build_key(STREAM_KEY), job.encode(job_id)
+            )
 
         logger.info("Job enqueued", extra={"job_name": job.name, "job_id": job_id})
         return job_id
@@ -189,8 +207,9 @@ class RedisQueue:
         client = get_redis()
         key = build_key(DELAYED_KEY)
         for raw in await client.zrange(key, 0, -1):
-            if json.loads(raw).get("id") == job_id:
-                await client.zrem(key, raw)
+            entry = _as_text(raw)
+            if json.loads(entry).get("id") == job_id:
+                await client.zrem(key, entry)
                 return True
         return False
 
@@ -231,7 +250,11 @@ class TaskRegistry:
             if name in self._handlers:
                 raise ValueError(f"Task '{name}' is already registered")
             self._handlers[name] = handler
-            logger.debug("Registered task %s -> %s", name, handler.__qualname__)
+            logger.debug(
+                "Registered task %s -> %s",
+                name,
+                getattr(handler, "__qualname__", repr(handler)),
+            )
             return handler
 
         return decorator
@@ -279,8 +302,8 @@ class InMemoryQueue:
         """Record every job."""
         return [await self.enqueue(job) for job in jobs]
 
-    async def cancel(self, job_id: str) -> bool:
-        """No-op; nothing is scheduled."""
+    async def cancel(self, job_id: str) -> bool:  # noqa: ARG002 - protocol shape
+        """No-op; nothing is ever scheduled, so nothing can be cancelled."""
         return False
 
     def clear(self) -> None:
@@ -301,5 +324,8 @@ def set_queue(implementation: Queue) -> None:
     queue = implementation
 
 
-# TODO: add the transactional outbox pattern if a job must never be lost when
-# the enqueue succeeds but the surrounding transaction later rolls back.
+# For a job that must never be lost when the enqueue succeeds but the
+# surrounding transaction later rolls back, stage a domain event through
+# app.infrastructure.outbox instead of enqueueing directly. The outbox row
+# commits atomically with the business change, and its relay does the
+# enqueueing afterwards — see docs/architecture/adr/0007-transactional-outbox.md.

@@ -27,31 +27,47 @@ from fastapi import FastAPI
 from fastapi.openapi.utils import get_openapi
 from fastapi.routing import APIRoute
 
-from app.common.responses import ErrorResponse
+from app.common.responses import error_responses
 from app.core.config import settings
+from app.core.discovery import collect_router_tags
 
 #: Tag metadata. Descriptions appear as section headers in the docs UI, and the
 #: declared order controls the order sections are rendered — otherwise tags
 #: appear in whatever order routers happened to be included.
-OPENAPI_TAGS: Final[list[dict[str, Any]]] = [
-    {
-        "name": "system",
-        "description": "Health, readiness and key distribution. Unauthenticated.",
-    },
-    # TODO: add one entry per feature module as it is built — a "name" matching
-    # the router's tag and a "description" that says what the section covers.
-]
+SYSTEM_TAG: Final[dict[str, Any]] = {
+    "name": "system",
+    "description": "Health, readiness and key distribution. Unauthenticated.",
+}
+
+#: Human-written descriptions for feature tags. A tag with no entry here still
+#: appears — discovered from the routers — just without prose. Optional by
+#: design: a missing description is a documentation gap, not a broken build.
+FEATURE_TAG_DESCRIPTIONS: Final[dict[str, str]] = {}
+
+
+def build_openapi_tags() -> list[dict[str, Any]]:
+    """Assemble tag metadata from the system tag plus discovered feature tags.
+
+    Derived from the routers rather than hand-listed, so the docs cannot drift
+    from what is actually mounted. Declared order controls render order;
+    otherwise sections appear in whatever order routers happened to load.
+    """
+    tags: list[dict[str, Any]] = [SYSTEM_TAG]
+    for tag in collect_router_tags():
+        if tag == SYSTEM_TAG["name"]:
+            continue
+        entry: dict[str, Any] = {"name": tag}
+        if description := FEATURE_TAG_DESCRIPTIONS.get(tag):
+            entry["description"] = description
+        tags.append(entry)
+    return tags
+
 
 #: Error responses attached to every operation. Documenting them once here
 #: keeps a `responses={...}` block off several hundred endpoint decorators.
-COMMON_ERROR_RESPONSES: Final[dict[int | str, dict[str, Any]]] = {
-    401: {"model": ErrorResponse, "description": "Authentication required."},
-    403: {"model": ErrorResponse, "description": "Permission denied."},
-    404: {"model": ErrorResponse, "description": "Resource not found."},
-    422: {"model": ErrorResponse, "description": "Validation failed."},
-    429: {"model": ErrorResponse, "description": "Rate limit exceeded."},
-    500: {"model": ErrorResponse, "description": "Unexpected server error."},
-}
+COMMON_ERROR_RESPONSES: Final[dict[int | str, dict[str, Any]]] = error_responses(
+    401, 403, 404, 422, 429, 500
+)
 
 
 def generate_operation_id(route: APIRoute) -> str:
@@ -94,7 +110,7 @@ def configure_openapi(app: FastAPI) -> None:
             version=settings.app.version,
             description=settings.app.description,
             routes=app.routes,
-            tags=OPENAPI_TAGS,
+            tags=build_openapi_tags(),
         )
 
         # Declared once, referenced per operation by the auth dependency. This
@@ -113,13 +129,33 @@ def configure_openapi(app: FastAPI) -> None:
 
         schema["info"]["x-environment"] = settings.app.environment
 
+        # Declared so generated clients and the docs "Try it out" button target
+        # the right host. Without it they assume the host the schema was fetched
+        # from, which is wrong for a schema committed to a client repository.
+        if settings.app.api_base_url:
+            schema["servers"] = [
+                {
+                    "url": settings.app.api_base_url,
+                    "description": settings.app.environment,
+                }
+            ]
+
+        # A schema shows the *shape* of an error; an example shows what one
+        # actually looks like. Integrators read the example first, and a wrong
+        # guess about the envelope is the most common integration bug.
+        components = schema.setdefault("components", {})
+        components.setdefault("examples", {})["ErrorEnvelope"] = {
+            "summary": "Standard error envelope",
+            "value": {
+                "error": {
+                    "code": "not_found",
+                    "message": "Resource not found.",
+                    "request_id": "0193f4a27c1170008f3a1b2c3d4e5f60",
+                }
+            },
+        }
+
         app.openapi_schema = schema
         return schema
 
     app.openapi = custom_openapi  # ty: ignore[invalid-assignment]
-
-    # TODO: add `servers` (staging and production base URLs) once deployed, so
-    # generated clients and the docs "Try it out" button target the right host.
-    # TODO: add response examples per endpoint — a schema shows the shape, an
-    # example shows what a real payload looks like, and integrators read the
-    # example first.

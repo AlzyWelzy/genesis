@@ -7,7 +7,7 @@ most cases, because those are the ones where a gap is a vulnerability rather
 than a cosmetic bug.
 """
 
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta, timezone
 
 import pytest
 
@@ -33,12 +33,15 @@ class TestDatetime:
         assert now.utcoffset() == timedelta(0)
 
     def test_ensure_utc_assumes_naive_is_utc(self) -> None:
-        naive = datetime(2026, 1, 15, 10, 30)
+        naive = datetime(2026, 1, 15, 10, 30)  # noqa: DTZ001 - naive on purpose
         assert ensure_utc(naive).tzinfo is UTC
 
     def test_ensure_utc_converts_aware(self) -> None:
-        offset = datetime(2026, 1, 15, 12, 0, tzinfo=timedelta(hours=2) and UTC)
-        assert ensure_utc(offset).utcoffset() == timedelta(0)
+        eastern = timezone(timedelta(hours=-5))
+        noon_eastern = datetime(2026, 1, 15, 12, 0, tzinfo=eastern)
+        converted = ensure_utc(noon_eastern)
+        assert converted.utcoffset() == timedelta(0)
+        assert converted.hour == 17
 
     def test_iso_round_trip(self) -> None:
         original = datetime(2026, 1, 15, 10, 30, tzinfo=UTC)
@@ -154,9 +157,10 @@ class TestMaskAndRedact:
         assert redacted["items"][0]["token"] == REDACTED
 
     def test_matching_is_case_insensitive(self) -> None:
-        assert strings.redact_sensitive({"Authorization": "Bearer x"})[
-            "Authorization"
-        ] == REDACTED
+        assert (
+            strings.redact_sensitive({"Authorization": "Bearer x"})["Authorization"]
+            == REDACTED
+        )
 
     def test_input_is_not_mutated(self) -> None:
         original = {"password": "hunter2"}
@@ -194,7 +198,8 @@ class TestCaseConversion:
 
 class TestCollections:
     def test_chunk_splits_evenly_and_keeps_the_remainder(self) -> None:
-        assert [list(c) for c in cols.chunk([1, 2, 3, 4, 5], 2)] == [[1, 2], [3, 4], [5]]
+        chunks = [list(c) for c in cols.chunk([1, 2, 3, 4, 5], 2)]
+        assert chunks == [[1, 2], [3, 4], [5]]
 
     def test_chunk_of_empty_yields_nothing(self) -> None:
         assert list(cols.chunk([], 3)) == []
@@ -298,7 +303,7 @@ class TestCrypto:
         assert crypto.verify_signature(b"payload", signature, "wrong") is False
 
     async def test_hash_stream_matches_hash_bytes(self) -> None:
-        async def source():  # noqa: ANN202 - local test helper
+        async def source():
             yield b"hello "
             yield b"world"
 
@@ -326,8 +331,9 @@ class TestFilenames:
         assert "\x00" not in files.sanitize_filename("evil\x00.png")
 
     def test_rtl_override_is_stripped(self) -> None:
-        """The RTL override disguises 'photo<RLO>gnp.exe' as 'photo.png'."""
-        assert "‮" not in files.sanitize_filename("photo‮gnp.exe")
+        """U+202E reverses display, making an .exe look like a .png."""
+        rlo = "\u202e"
+        assert rlo not in files.sanitize_filename(f"photo{rlo}gnp.exe")
 
     def test_get_extension(self) -> None:
         assert files.get_extension("Photo.PNG") == ".png"
@@ -368,7 +374,7 @@ class TestContentSniffing:
 
 class TestStreaming:
     async def test_rechunks_to_the_requested_size(self) -> None:
-        async def source():  # noqa: ANN202 - local test helper
+        async def source():
             yield b"abcde"
             yield b"fghij"
 
@@ -379,7 +385,7 @@ class TestStreaming:
     async def test_enforces_the_ceiling_mid_stream(self) -> None:
         """Content-Length cannot be trusted, so the limit is enforced as it reads."""
 
-        async def source():  # noqa: ANN202 - local test helper
+        async def source():
             for _ in range(10):
                 yield b"x" * 100
 
@@ -396,10 +402,10 @@ class TestStreaming:
 
 
 class TestSafeJoin:
-    def test_resolves_beneath_the_root(self, tmp_path) -> None:  # noqa: ANN001
+    def test_resolves_beneath_the_root(self, tmp_path) -> None:
         assert files.safe_join(tmp_path, "a/b.txt").is_relative_to(tmp_path.resolve())
 
-    def test_refuses_to_escape_the_root(self, tmp_path) -> None:  # noqa: ANN001
+    def test_refuses_to_escape_the_root(self, tmp_path) -> None:
         """Without this check, an upload key can write anywhere."""
         with pytest.raises(ValueError, match="escapes"):
             files.safe_join(tmp_path, "../../etc/passwd")

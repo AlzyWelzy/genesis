@@ -32,15 +32,18 @@ from typing import Any, Final
 from fastapi import APIRouter, Response, status
 
 from app.core.config import settings
+from app.core.exceptions import NotFoundError
 from app.core.security import build_jwks
 from app.infrastructure.database.session import check_database_health
+from app.infrastructure.observability.metrics import PrometheusMetrics, get_metrics
 from app.infrastructure.redis.client import check_redis_health
+from app.system.state import is_started
 
 router = APIRouter(tags=["system"])
 
 #: Excluded from the access log and the rate limiter — see the settings for
 #: both. Probes fire every few seconds per replica.
-PROBE_PATHS: Final[tuple[str, ...]] = ("/health", "/live", "/ready")
+PROBE_PATHS: Final[tuple[str, ...]] = ("/health", "/live", "/ready", "/metrics")
 
 
 @router.get("/live", summary="Liveness probe", include_in_schema=False)
@@ -113,9 +116,41 @@ async def jwks() -> dict[str, Any]:
     return build_jwks()
 
 
-# TODO: add GET /metrics (Prometheus exposition) once
-# OBSERVABILITY__METRICS_ENABLED is implemented. Bind it to an internal port or
-# require an auth token: request rates and error counts per endpoint are useful
-# reconnaissance.
-# TODO: add a startup probe if boot ever exceeds a few seconds, so a slow start
-# is not mistaken for a hung process by the liveness probe.
+@router.get("/metrics", summary="Prometheus metrics", include_in_schema=False)
+async def prometheus_metrics() -> Response:
+    """Expose metrics in the Prometheus exposition format.
+
+    Returns 404 when metrics are disabled, so a scraper gets an unambiguous
+    answer rather than an empty 200 that looks like a healthy service reporting
+    nothing.
+
+    **Do not expose this publicly.** Request rates, error counts and endpoint
+    names per route are useful reconnaissance. Bind it to an internal port, or
+    put it behind the ingress rules that already protect the admin surface.
+    """
+    recorder = get_metrics()
+    if not isinstance(recorder, PrometheusMetrics):
+        raise NotFoundError("Metrics are not enabled on this instance.")
+
+    body, content_type = recorder.render()
+    return Response(content=body, media_type=content_type)
+
+
+@router.get("/startup", summary="Startup probe", include_in_schema=False)
+async def startup(response: Response) -> dict[str, Any]:
+    """Report whether the application has finished initialising.
+
+    Kubernetes suspends the liveness and readiness probes until this one
+    succeeds. Without it, a boot that takes longer than the liveness
+    ``failureThreshold`` is indistinguishable from a hung process, and the
+    orchestrator kills the container — repeatedly, producing a crash loop whose
+    only cause is that startup was slow.
+
+    Separate from ``/live`` because they answer different questions at
+    different times: this one is asked once and stops being asked, whereas
+    liveness is asked forever.
+    """
+    ready = is_started()
+    if not ready:
+        response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+    return {"status": "started" if ready else "starting"}

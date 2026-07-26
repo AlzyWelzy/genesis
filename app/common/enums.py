@@ -20,6 +20,8 @@ Rules
 
 from enum import StrEnum
 
+from sqlalchemy import Enum as SAEnum
+
 
 class SortOrder(StrEnum):
     """Direction for an ordered query."""
@@ -68,6 +70,55 @@ class JobStatus(StrEnum):
     CANCELLED = "cancelled"
 
 
-# TODO: when an enum is persisted, decide between a native PostgreSQL ENUM type
-# (validated by the database, but every change needs a migration) and a VARCHAR
-# with a CHECK constraint (cheaper to evolve). Record the choice here.
+def enum_column(enum_type: type[StrEnum], *, length: int = 32) -> SAEnum:
+    """Build the column type for a persisted enum.
+
+    The decision, and why
+    ---------------------
+    PostgreSQL offers a native ``ENUM`` type. It is rejected here in favour of
+    ``VARCHAR`` plus a ``CHECK`` constraint, which is what this helper builds
+    (SQLAlchemy's ``Enum(..., native_enum=False)``).
+
+    Native ``ENUM`` validates in the database and is compact, but adding a
+    value requires ``ALTER TYPE``, which **cannot run inside a transaction**
+    before PostgreSQL 12 and still cannot be rolled back afterwards. *Removing*
+    or reordering a value means creating a new type, rewriting every column
+    that uses it, and dropping the old one — on a large table, a long exclusive
+    lock. Enum values change far more often than anyone predicts.
+
+    ``VARCHAR`` + ``CHECK`` keeps database-side validation — an invalid value
+    is still rejected — while making an added value a cheap constraint swap.
+    The storage difference is irrelevant next to that.
+
+    ``length`` is validated against the members so a value longer than the
+    column silently truncating is impossible.
+
+    Args:
+        enum_type: The ``StrEnum`` being persisted.
+        length: VARCHAR length. Must fit every member.
+
+    Returns:
+        The SQLAlchemy column type.
+
+    Raises:
+        ValueError: When a member does not fit in ``length``.
+    """
+    longest = max(len(member.value) for member in enum_type)
+    if longest > length:
+        raise ValueError(
+            f"{enum_type.__name__} has a {longest}-character member but "
+            f"length={length}; widen the column or shorten the value."
+        )
+
+    return SAEnum(
+        enum_type,
+        native_enum=False,
+        length=length,
+        # Store the *value*, not the Python member name. The value is the
+        # public contract — it appears in APIs and exports — while the member
+        # name is an implementation detail that should stay renameable.
+        values_callable=lambda enum: [member.value for member in enum],
+        # Named so the CHECK constraint is deterministic and Alembic can drop it.
+        create_constraint=True,
+        name=f"ck_{enum_type.__name__.lower()}",
+    )

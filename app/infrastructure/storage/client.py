@@ -20,8 +20,8 @@ Contract notes
 """
 
 from collections.abc import AsyncIterator
-from dataclasses import dataclass
-from typing import Protocol
+from dataclasses import dataclass, field
+from typing import Final, Protocol
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,6 +74,74 @@ class StorageProvider(Protocol):
         """Return a time-limited URL granting direct read access."""
         ...
 
+    async def copy(self, source_key: str, destination_key: str) -> StoredObject:
+        """Copy an object within the same store."""
+        ...
 
-# TODO: add `copy`/`move` for the "promote from a temp upload prefix" flow.
-# TODO: add a multipart upload API once files can exceed a single request body.
+    async def move(self, source_key: str, destination_key: str) -> StoredObject:
+        """Move an object, deleting the source once the copy succeeds."""
+        ...
+
+
+@dataclass(frozen=True, slots=True)
+class MultipartUpload:
+    """A multipart upload in progress.
+
+    Why multipart exists
+    --------------------
+    A single ``PUT`` has to complete in one connection. For a large object that
+    means a failure at 95% starts again from zero, and the whole body has to be
+    held somewhere while it transfers. Multipart splits it into independently
+    retryable chunks that can also upload concurrently.
+
+    S3 requires parts of at least 5 MiB (except the last). Below that, a plain
+    upload is simpler and cheaper — there is no reason to reach for this until
+    objects genuinely exceed a comfortable single request.
+
+    **An abandoned multipart upload still costs money.** Parts are stored and
+    billed until the upload is completed or aborted, and they are invisible in a
+    normal bucket listing. Always :meth:`abort` on failure, and set a lifecycle
+    rule to clean up incomplete uploads after a few days as a backstop.
+
+    Attributes:
+        key: Storage key the finished object will occupy.
+        upload_id: Provider-assigned identifier for this upload.
+        parts: Completed parts, in order, as ``(part_number, etag)``.
+    """
+
+    key: str
+    upload_id: str
+    parts: list[tuple[int, str]] = field(default_factory=list)
+
+
+#: Minimum size for a non-final part, imposed by S3. Enforced locally so an
+#: undersized part fails immediately rather than at completion, by which point
+#: every other part has already been uploaded and paid for.
+MIN_PART_SIZE: Final[int] = 5 * 1024 * 1024
+
+
+class MultipartCapable(Protocol):
+    """Optional multipart interface, implemented by providers that support it.
+
+    Separate from :class:`StorageProvider` so the local filesystem provider is
+    not forced to fake an API it has no need for. Callers check with
+    ``isinstance(provider, MultipartCapable)``.
+    """
+
+    async def begin_multipart(self, key: str, *, content_type: str) -> MultipartUpload:
+        """Start a multipart upload."""
+        ...
+
+    async def upload_part(
+        self, upload: MultipartUpload, part_number: int, data: bytes
+    ) -> MultipartUpload:
+        """Upload one part. Part numbers start at 1 and must be contiguous."""
+        ...
+
+    async def complete_multipart(self, upload: MultipartUpload) -> StoredObject:
+        """Assemble the uploaded parts into the final object."""
+        ...
+
+    async def abort_multipart(self, upload: MultipartUpload) -> None:
+        """Discard an incomplete upload and stop paying for its parts."""
+        ...

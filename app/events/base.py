@@ -19,6 +19,7 @@ transaction. Events describe the past and cannot be "cancelled" by a handler —
 a validation check must be a direct call, not a listener.
 """
 
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime
 from decimal import Decimal
@@ -104,6 +105,17 @@ class DomainEvent:
         return tuple(f.name for f in fields(cls) if f.name not in _ENVELOPE_FIELDS)
 
 
+#: Scalar conversions applied by :func:`_to_jsonable`. ``Decimal`` becomes a
+#: string, never a float: binary floats cannot represent decimal fractions
+#: exactly, and an event carrying money must round-trip to the cent.
+_SCALAR_ENCODERS: tuple[tuple[type, Callable[[Any], Any]], ...] = (
+    (datetime, lambda value: value.isoformat()),
+    (UUID, str),
+    (Decimal, str),
+    (Enum, lambda value: value.value),
+)
+
+
 def _to_jsonable(value: Any) -> Any:
     """Convert a value into something ``json.dumps`` accepts.
 
@@ -112,24 +124,14 @@ def _to_jsonable(value: Any) -> Any:
     fails loudly at the encoder rather than being silently stringified into
     something a consumer cannot parse back.
     """
-    match value:
-        case datetime():
-            return value.isoformat()
-        case UUID():
-            return str(value)
-        case Decimal():
-            # As a string, never a float: binary floats cannot represent
-            # decimal fractions exactly, and an event carrying money must
-            # round-trip to the cent.
-            return str(value)
-        case Enum():
-            return value.value
-        case dict():
-            return {key: _to_jsonable(item) for key, item in value.items()}
-        case list() | tuple() | set():
-            return [_to_jsonable(item) for item in value]
-        case _:
-            return value
+    for scalar_type, encode in _SCALAR_ENCODERS:
+        if isinstance(value, scalar_type):
+            return encode(value)
+    if isinstance(value, dict):
+        return {key: _to_jsonable(item) for key, item in value.items()}
+    if isinstance(value, list | tuple | set):
+        return [_to_jsonable(item) for item in value]
+    return value
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

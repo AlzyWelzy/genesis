@@ -209,7 +209,9 @@ class BaseRepository[ModelT: Base]:
         thing for both kinds of model.
         """
         if hasattr(entity, "deleted_at"):
-            entity.deleted_at = utc_now()
+            # Supplied by SoftDeleteMixin; the checker cannot tie a runtime
+            # hasattr narrowing to a mixin-declared column.
+            entity.deleted_at = utc_now()  # ty: ignore[invalid-assignment]
             await self.session.flush()
             return
         await self.session.delete(entity)
@@ -233,6 +235,9 @@ class TenantRepository[ModelT: Base](BaseRepository[ModelT]):
 
     def select(self) -> Select[tuple[ModelT]]:
         """Start a query scoped to the current tenant."""
+        # `tenant_id` comes from TenantMixin, which every model paired with
+        # this repository inherits. The bound is `Base`, so the checker
+        # cannot see the mixin's column.
         return super().select().where(self.model.tenant_id == require_tenant_id())
 
     async def add(self, entity: ModelT) -> ModelT:
@@ -243,14 +248,14 @@ class TenantRepository[ModelT: Base](BaseRepository[ModelT]):
         happen, and stamping it centrally makes the field impossible to
         influence from outside.
         """
-        entity.tenant_id = require_tenant_id()
+        entity.tenant_id = require_tenant_id()  # ty: ignore[unresolved-attribute]
         return await super().add(entity)
 
     async def add_all(self, entities: Sequence[ModelT]) -> Sequence[ModelT]:
         """Stage several rows, stamping each with the current tenant."""
         tenant_id = require_tenant_id()
         for entity in entities:
-            entity.tenant_id = tenant_id
+            entity.tenant_id = tenant_id  # ty: ignore[unresolved-attribute]
         return await super().add_all(entities)
 
 
@@ -260,9 +265,7 @@ class SoftDeleteRepositoryMixin:
     Mixed in *before* the repository base so its :meth:`select` wraps the
     scoped one::
 
-        class InvoiceRepository(
-            SoftDeleteRepositoryMixin, TenantRepository[Invoice]
-        ):
+        class InvoiceRepository(SoftDeleteRepositoryMixin, TenantRepository[Invoice]):
             model = Invoice
 
     The escape hatch is explicit and named, so restoring a record or building
@@ -273,7 +276,13 @@ class SoftDeleteRepositoryMixin:
 
     def select(self) -> Select[Any]:
         """Start a query excluding soft-deleted rows."""
-        return super().select().where(self.model.deleted_at.is_(None))
+        # Cooperative mixin: `super()` resolves to the repository base at
+        # runtime via the MRO, which a static checker cannot follow.
+        return (
+            super()
+            .select()  # ty: ignore[unresolved-attribute]
+            .where(self.model.deleted_at.is_(None))
+        )
 
     def select_including_deleted(self) -> Select[Any]:
         """Start a query that includes soft-deleted rows.
@@ -281,4 +290,4 @@ class SoftDeleteRepositoryMixin:
         For restore flows and admin tooling only. Named rather than a boolean
         flag so every use is greppable.
         """
-        return super().select()
+        return super().select()  # ty: ignore[unresolved-attribute]

@@ -34,5 +34,8 @@ NAMING_CONVENTION: Final[dict[str, str]] = {
 #: Schema every model lives in unless it explicitly overrides ``__table_args__``.
 DEFAULT_SCHEMA: Final[str | None] = None
 
-# TODO: if multi-tenancy uses schema-per-tenant, document here how the schema
-# is swapped at session level (SET search_path) rather than per model.
+# Tenancy is row-level (a `tenant_id` column), not schema-per-tenant, so every
+# model lives in the default schema and `DEFAULT_SCHEMA` stays None. Were that
+# ever revisited, the swap would belong at session level (`SET search_path`)
+# rather than on each model — but it would also mean running every migration
+# once per tenant schema, which is the reason it was not chosen.

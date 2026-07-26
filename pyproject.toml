@@ -11,13 +11,28 @@ dependencies = [
     "asyncpg>=0.31.0",
     "cryptography>=49.0.0",
     "fastapi>=0.140.0",
+    "httpx>=0.28.1",
+    "jinja2>=3.1.6",
     "pwdlib[argon2]>=0.3.0",
     "pydantic-settings>=2.14.2",
     "pyjwt>=2.13.0",
     "python-multipart>=0.0.32",
     "redis>=8.0.1",
     "sqlalchemy>=2.0.51",
-    "uvicorn>=0.51.0",
+    "uvicorn[standard]>=0.51.0",
+]
+
+[project.optional-dependencies]
+# Observability backends are optional so a deployment that does not use them
+# does not carry their dependency trees. Both degrade to no-ops when absent —
+# an observability dependency must never be why the app refuses to start.
+metrics = ["prometheus-client>=0.21"]
+tracing = [
+    "opentelemetry-sdk>=1.29",
+    "opentelemetry-exporter-otlp-proto-grpc>=1.29",
+    "opentelemetry-instrumentation-fastapi>=0.50b0",
+    "opentelemetry-instrumentation-sqlalchemy>=0.50b0",
+    "opentelemetry-instrumentation-redis>=0.50b0",
 ]
 
 [dependency-groups]
@@ -99,7 +114,9 @@ ignore = [
 #   PLR0913/0917    parametrised tests take one argument per case column
 #   PLC0415         local imports isolate a module under test or avoid cycles
 #   SLF001          patching a private seam is legitimate in a fixture
-#   ARG001          fixtures are requested by name and often unused in the body
+#   ARG001/ARG002   fixtures are requested by name and often unused in the body
+#   ANN001/ANN201   a fixture's type is the object it yields; spelling it out
+#                   adds imports and noise without catching anything
 "tests/**/*.py" = [
     "S101",
     "S105",
@@ -114,7 +131,21 @@ ignore = [
     "PLC0415",
     "SLF001",
     "ARG001",
+    "ARG002",
+    "ANN001",
+    "ANN201",
+    "ANN202",
 ]
+# SQLAlchemy's TypeDecorator contract fixes both the signature and the
+# parameter *names* of process_bind_param / process_result_value. `dialect` is
+# unused by these decorators but cannot be renamed or dropped: doing either
+# breaks the override, which ty correctly rejects.
+"app/infrastructure/database/types.py" = ["ARG002"]
+# Observability backends are optional extras. Importing them at module level
+# would crash any deployment that has not installed them, which is the exact
+# outcome the optional-extra design exists to prevent — so the imports are
+# deliberately inside the functions that need them.
+"app/infrastructure/observability/*.py" = ["PLC0415"]
 # Alembic owns these files' structure; its templates are not ours to restyle.
 "migrations/**/*.py" = ["D", "ANN", "ERA", "INP001"]
 # Scripts are CLIs — printing is their interface.

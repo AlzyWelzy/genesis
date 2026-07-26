@@ -94,6 +94,11 @@ class AppSettings(BaseModel):
     #: Set when the app runs behind a proxy that strips a path prefix.
     root_path: str = ""
 
+    #: Public base URL, published in the OpenAPI ``servers`` block so
+    #: generated clients target the right host rather than assuming the one
+    #: the schema happened to be fetched from.
+    api_base_url: str = ""
+
     #: Compress responses above this size. Below ~500 bytes compression costs
     #: more CPU than it saves bandwidth.
     gzip_minimum_size: int = 1000
@@ -248,6 +253,20 @@ class SecuritySettings(BaseModel):
     #: issued to them. This is the only way to revoke a stateless token before
     #: it expires — used for logout-everywhere, password change and lockout.
     token_version_claim: str = "tv"  # noqa: S105 - a claim name, not a secret
+
+    #: Fernet key for :class:`~app.infrastructure.database.types.EncryptedString`
+    #: columns. Absent until an encrypted column exists, and required from the
+    #: moment one does — reading such a column without it raises rather than
+    #: silently returning ciphertext.
+    #:
+    #: Generate one with ``Fernet.generate_key()`` from the cryptography
+    #: package; it must be a 32-byte url-safe base64 key.
+    encryption_key: SecretStr | None = None
+
+    #: Key for blind indexes over encrypted columns. Must differ from
+    #: ``encryption_key``: sharing them means one leak compromises both the
+    #: ciphertext and the searchable fingerprints.
+    blind_index_key: SecretStr | None = None
 
     #: Failed attempts before an account is temporarily locked.
     max_failed_login_attempts: int = 10

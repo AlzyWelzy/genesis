@@ -210,27 +210,39 @@ def decode_cursor(cursor: str, *, secret: str) -> dict[str, Any]:
             "invalid cursor" so a client cannot distinguish a signature failure
             from a decode failure and probe the format.
     """
-    invalid = ValidationError(
-        "Invalid or expired cursor.", code="invalid_cursor"
-    )
+    values = _decode_cursor_payload(cursor, secret)
+    if values is None:
+        raise ValidationError("Invalid or expired cursor.", code="invalid_cursor")
+    return values
 
+
+def _decode_cursor_payload(cursor: str, secret: str) -> dict[str, Any] | None:
+    """Decode and verify a cursor, returning ``None`` if it is not usable.
+
+    Split out so the caller raises once. Every failure mode collapses to
+    ``None`` on purpose: distinguishing "bad signature" from "bad base64" from
+    "stale version" would let a client probe the cursor format.
+    """
     try:
         padding = "=" * (-len(cursor) % 4)
         raw = base64.urlsafe_b64decode(cursor + padding)
-        payload, _, signature = raw.rpartition(b".")
-        if not payload:
-            raise invalid
+    except ValueError, TypeError:
+        return None
 
-        expected = hmac.new(secret.encode(), payload, hashlib.sha256).digest()[:16]
-        if not hmac.compare_digest(expected, signature):
-            raise invalid
+    payload, separator, signature = raw.rpartition(b".")
+    if not payload or not separator:
+        return None
 
+    expected = hmac.new(secret.encode(), payload, hashlib.sha256).digest()[:16]
+    if not hmac.compare_digest(expected, signature):
+        return None
+
+    try:
         decoded = json.loads(payload)
-    except ValidationError:
-        raise
-    except Exception as exc:
-        raise invalid from exc
+    except json.JSONDecodeError, UnicodeDecodeError:
+        return None
 
-    if decoded.get("v") != CURSOR_VERSION:
-        raise invalid
-    return decoded["k"]
+    if not isinstance(decoded, dict) or decoded.get("v") != CURSOR_VERSION:
+        return None
+    keys = decoded.get("k")
+    return keys if isinstance(keys, dict) else None

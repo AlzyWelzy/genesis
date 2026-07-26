@@ -28,6 +28,7 @@ from collections.abc import Awaitable, Callable
 from uuid import uuid4
 
 from fastapi import FastAPI, Request, Response
+from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.cors import CORSMiddleware
 from starlette.middleware.gzip import GZipMiddleware
@@ -36,13 +37,23 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from app.common.constants import CORRELATION_ID_HEADER, REQUEST_ID_HEADER
 from app.core.config import settings
 from app.core.context import correlation_id_var, get_user_id, request_id_var
-from app.core.exceptions import RateLimitError
+from app.core.exceptions import RateLimitError, build_error_body
 from app.core.logging import get_logger
+from app.infrastructure.observability.metrics import (
+    HTTP_DURATION,
+    HTTP_REQUESTS,
+    get_metrics,
+)
 from app.infrastructure.redis.rate_limit import check_rate_limit, resolve_limit
 
 logger = get_logger(__name__)
 
 type CallNext = Callable[[Request], Awaitable[Response]]
+
+#: Scope keys mirroring the context vars. Prefixed to avoid colliding with
+#: anything ASGI or a future middleware might define.
+REQUEST_ID_SCOPE_KEY = "genesis.request_id"
+CORRELATION_ID_SCOPE_KEY = "genesis.correlation_id"
 
 
 class RequestContextMiddleware(BaseHTTPMiddleware):
@@ -66,6 +77,13 @@ class RequestContextMiddleware(BaseHTTPMiddleware):
         """Bind context IDs, call the app, and echo the IDs on the response."""
         request_id = request.headers.get(REQUEST_ID_HEADER) or uuid4().hex
         correlation_id = request.headers.get(CORRELATION_ID_HEADER) or request_id
+
+        # Also stashed on the scope. The ContextVar is reset in `finally`,
+        # but Starlette's ServerErrorMiddleware sits *outside* this middleware,
+        # so its handler runs after that reset. The scope survives, which is
+        # what lets a 500 — the error where an ID matters most — still carry one.
+        request.scope[REQUEST_ID_SCOPE_KEY] = request_id
+        request.scope[CORRELATION_ID_SCOPE_KEY] = correlation_id
 
         request_token = request_id_var.set(request_id)
         correlation_token = correlation_id_var.set(correlation_id)
@@ -99,6 +117,24 @@ class AccessLogMiddleware(BaseHTTPMiddleware):
         started = time.perf_counter()
         response = await call_next(request)
         duration_ms = (time.perf_counter() - started) * 1000
+
+        # Labelled with the route *template*, never the resolved path. Labelling
+        # by path would mint a new time series per invoice ID and take the
+        # metrics backend down long before it touched the application.
+        route = _route_template(request)
+        recorder = get_metrics()
+        recorder.increment(
+            HTTP_REQUESTS,
+            method=request.method,
+            route=route,
+            status=str(response.status_code),
+        )
+        recorder.observe(
+            HTTP_DURATION,
+            duration_ms / 1000,
+            method=request.method,
+            route=route,
+        )
 
         logger.info(
             "%s %s %s",
@@ -142,11 +178,24 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         )
 
         if not result.allowed:
-            # Raised rather than returned so it flows through the standard
-            # exception handler and gets the same envelope as every other error.
-            raise RateLimitError(
-                retry_after=result.reset_after,
-                headers=result.headers(),
+            # Returned, NOT raised. An exception raised inside a
+            # BaseHTTPMiddleware never reaches the application's exception
+            # handlers — those live in ExceptionMiddleware, which sits *below*
+            # this one in the stack. Raising here produces a 500 rather than a
+            # 429, which is both wrong and actively misleading: the caller is
+            # told the server broke when in fact it deliberately refused them.
+            #
+            # The envelope is built with the same helper the handlers use, so
+            # the shape stays identical to every other error.
+            error = RateLimitError(retry_after=result.reset_after)
+            logger.info(
+                "Rate limit exceeded",
+                extra={"identity": identity, "http_path": request.url.path},
+            )
+            return JSONResponse(
+                status_code=error.status_code,
+                content=build_error_body(error.code, error.message),
+                headers={**error.headers, **result.headers()},
             )
 
         response = await call_next(request)
@@ -154,6 +203,17 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         # client can slow down *before* it gets a 429.
         response.headers.update(result.headers())
         return response
+
+
+def _route_template(request: Request) -> str:
+    """Return the matched route's path template, e.g. ``/invoices/{id}``.
+
+    Falls back to ``"unmatched"`` rather than the raw path: a 404 sweep would
+    otherwise create one metric series per URL an attacker tries, which is a
+    trivially cheap way to exhaust the metrics backend.
+    """
+    route = request.scope.get("route")
+    return getattr(route, "path", None) or "unmatched"
 
 
 def _resolve_identity(request: Request) -> tuple[str, bool]:

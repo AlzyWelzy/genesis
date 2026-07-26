@@ -20,6 +20,11 @@ from typing import Final
 
 from app.common.constants import STREAM_CHUNK_SIZE
 
+#: Decimal units (1 kB = 1000 B), matching what operating systems and cloud
+#: consoles report. Binary units would show a different number for the same
+#: file than the customer sees in their own storage browser.
+_SIZE_STEP = 1000
+
 _UNSAFE_FILENAME_CHARS: Final[re.Pattern[str]] = re.compile(r"[^\w.\- ]+")
 _COLLAPSE_DOTS: Final[re.Pattern[str]] = re.compile(r"\.{2,}")
 
@@ -60,8 +65,10 @@ def sanitize_filename(filename: str) -> str:
     basename = filename.replace("\\", "/").split("/")[-1]
 
     # Drop control characters and anything Unicode classes as a "format" or
-    # "other" character — including the right-to-left override used to disguise
-    # an executable as "photo‮gnp.exe".
+    # "other" character. This includes U+202E RIGHT-TO-LEFT OVERRIDE, which
+    # reverses the display of everything after it: a file named
+    # "photo\\u202egnp.exe" renders as "photo.png" in a file listing while
+    # still executing as .exe.
     cleaned = "".join(
         char for char in basename if unicodedata.category(char)[0] not in ("C", "Z")
     )
@@ -170,13 +177,13 @@ def human_readable_size(size_bytes: int) -> str:
     Returns:
         The formatted size.
     """
-    if size_bytes < 1000:
+    if size_bytes < _SIZE_STEP:
         return f"{size_bytes} B"
 
     size = float(size_bytes)
     for unit in ("kB", "MB", "GB", "TB"):
-        size /= 1000
-        if size < 1000:
+        size /= _SIZE_STEP
+        if size < _SIZE_STEP:
             return f"{size:.1f} {unit}"
     return f"{size:.1f} PB"
 

@@ -13,11 +13,23 @@ Feature schemas inherit from :class:`BaseSchema` and use these aliases; nothing
 here knows about any specific feature.
 """
 
+from collections.abc import Mapping
 from datetime import datetime
 from typing import Annotated, Any
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SecretBytes,
+    SecretStr,
+    field_serializer,
+)
+from pydantic.functional_serializers import SerializerFunctionWrapHandler
+from pydantic_core.core_schema import FieldSerializationInfo
+
+from app.common.constants import REDACTED, SENSITIVE_FIELD_NAMES
 
 # --- Primitive aliases -----------------------------------------------------
 
@@ -82,5 +94,59 @@ class TimestampedSchema(ORMSchema):
     updated_at: Timestamp
 
 
-# TODO: add a `SecretStr`-aware serialiser so a schema can never accidentally
-# emit a credential in a response body.
+class SafeResponseSchema(ORMSchema):
+    """Response base that refuses to serialise secrets.
+
+    The failure this prevents is mundane and severe: someone adds
+    ``api_key: SecretStr`` to a model, a response schema is built from that
+    model with ``from_attributes``, and the key ships in a JSON body. Pydantic
+    renders a bare ``SecretStr`` as ``"**********"`` in ``model_dump()`` but
+    **not** in ``model_dump_json()`` unless told to, and the JSON path is the
+    one an API uses.
+
+    Inheriting from this makes the safe behaviour the default. A field that
+    genuinely must be returned — a token the client just asked for — should be
+    a plain ``str`` on a schema that says so in its name, so the decision is
+    visible in review rather than implied by a type.
+    """
+
+    model_config = ConfigDict(
+        from_attributes=True,
+        extra="ignore",
+        # Applies to JSON serialisation too, which is the gap that leaks.
+        ser_json_bytes="base64",
+    )
+
+    @field_serializer("*", mode="wrap", check_fields=False)
+    def _mask_secrets(
+        self,
+        value: Any,
+        handler: SerializerFunctionWrapHandler,
+        _info: FieldSerializationInfo,
+    ) -> Any:
+        """Replace any ``SecretStr``/``SecretBytes`` with a fixed placeholder."""
+        if isinstance(value, SecretStr | SecretBytes):
+            return REDACTED
+        return handler(value)
+
+
+def assert_no_secrets(payload: Mapping[str, Any], *, where: str = "response") -> None:
+    """Raise if a payload contains a value that looks like a live credential.
+
+    A belt-and-braces check for the highest-risk endpoints, and a useful
+    assertion in tests. Deliberately *not* wired into every response: scanning
+    every payload on every request costs more than it saves, and the schema
+    layer is the right place to be correct.
+
+    Args:
+        payload: The serialised body.
+        where: Included in the error, to say which response was at fault.
+
+    Raises:
+        RuntimeError: When a sensitive key carries a non-redacted value.
+    """
+    for key, value in payload.items():
+        if key.lower() in SENSITIVE_FIELD_NAMES and value not in (None, REDACTED):
+            raise RuntimeError(
+                f"Refusing to emit {where}: field {key!r} looks like a credential."
+            )

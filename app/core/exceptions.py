@@ -228,31 +228,53 @@ def build_error_body(
     code: str,
     message: str,
     details: dict[str, Any] | None = None,
+    request_id: str | None = None,
 ) -> dict[str, Any]:
     """Build the one and only error envelope shape the API emits.
 
     The request ID is attached automatically so a user can quote it to support
     and land on the exact log line, without the API ever exposing internals.
+
+    Args:
+        code: Stable machine-readable identifier.
+        message: Safe-to-display description.
+        details: Structured context, e.g. per-field errors.
+        request_id: Overrides the ambient context. Needed for the unhandled-
+            exception handler, which runs outside the request context.
     """
     error: dict[str, Any] = {"code": code, "message": message}
     if details:
         error["details"] = details
-    if request_id := get_request_id():
-        error["request_id"] = request_id
+    if resolved := request_id or get_request_id():
+        error["request_id"] = resolved
     return {"error": error}
 
 
-def _error_response(
+def request_id_from(request: Request) -> str | None:
+    """Read the request ID from the ASGI scope.
+
+    The scope outlives the ``ContextVar``, which the request-context middleware
+    resets on the way out. Starlette's ServerErrorMiddleware is *outside* that
+    middleware, so by the time it handles an unhandled exception the context is
+    already gone — and a 500 with no correlating ID is the least useful error a
+    support team can receive.
+    """
+    return request.scope.get("genesis.request_id")
+
+
+def _error_response(  # noqa: PLR0913 - internal renderer; extras are keyword-only
     status_code: int,
     code: str,
     message: str,
+    *,
     details: dict[str, Any] | None = None,
     headers: dict[str, str] | None = None,
+    request_id: str | None = None,
 ) -> JSONResponse:
     """Render an error envelope as a JSON response."""
     return JSONResponse(
         status_code=status_code,
-        content=build_error_body(code, message, details),
+        content=build_error_body(code, message, details, request_id),
         headers=headers or None,
     )
 
@@ -277,7 +299,11 @@ def register_exception_handlers(app: FastAPI) -> None:
         else:
             logger.info("Client error: %s", exc.message, extra={"code": exc.code})
         return _error_response(
-            exc.status_code, exc.code, exc.message, exc.details, exc.headers
+            exc.status_code,
+            exc.code,
+            exc.message,
+            details=exc.details,
+            headers=exc.headers,
         )
 
     @app.exception_handler(RequestValidationError)
@@ -294,7 +320,7 @@ def register_exception_handlers(app: FastAPI) -> None:
             status.HTTP_422_UNPROCESSABLE_CONTENT,
             "validation_error",
             "Request validation failed.",
-            {
+            details={
                 "fields": [
                     {
                         "field": ".".join(str(part) for part in error["loc"][1:]),
@@ -325,7 +351,7 @@ def register_exception_handlers(app: FastAPI) -> None:
         )
 
     @app.exception_handler(Exception)
-    async def handle_unexpected(_: Request, exc: Exception) -> JSONResponse:
+    async def handle_unexpected(request: Request, exc: Exception) -> JSONResponse:
         """Anything unhandled is a bug: log the traceback, tell the client nothing.
 
         The response carries only a request ID. That is enough for a user to
@@ -337,4 +363,5 @@ def register_exception_handlers(app: FastAPI) -> None:
             status.HTTP_500_INTERNAL_SERVER_ERROR,
             "internal_error",
             "An unexpected error occurred.",
+            request_id=request_id_from(request),
         )

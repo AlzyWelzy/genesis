@@ -38,6 +38,12 @@ async def init_redis() -> Redis:
     misconfigured Redis into a startup failure rather than a surprise on the
     first request that happens to need a cache.
 
+    The client is cached for the process, and is **bound to the event loop that
+    created it**. That is correct for a server, which has one loop for its whole
+    life, but it means anything creating a fresh loop — a test suite, a worker
+    restart — must call :func:`close_redis` first, or the next use fails with
+    "Event loop is closed".
+
     Returns:
         The connected client.
     """

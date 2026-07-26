@@ -30,14 +30,37 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from app.core.config import settings
+from app.core.discovery import import_side_effect_modules
 from app.core.logging import configure_logging, get_logger
 from app.core.security import get_signing_key
 from app.infrastructure.database.session import check_database_health, dispose_engine
+from app.infrastructure.email.providers import get_email_provider, set_email_provider
 from app.infrastructure.observability.metrics import configure_metrics
 from app.infrastructure.observability.tracing import configure_tracing, shutdown_tracing
 from app.infrastructure.redis.client import close_redis, init_redis
+from app.infrastructure.storage.providers import get_storage_provider, set_storage
+from app.system.state import mark_started, mark_stopped
 
 logger = get_logger(__name__)
+
+
+def register_event_handlers() -> None:
+    """Import every feature's models, handlers and tasks.
+
+    Subscriptions and task registrations are created by decorators, and a
+    decorator only runs when its module is imported. A handler in a module
+    nothing imports is a subscription that silently does not exist — the most
+    common way an event system appears broken while every unit test passes.
+
+    Discovery removes the hand-maintained import list that would otherwise
+    drift; see :mod:`app.core.discovery`.
+    """
+    loaded = import_side_effect_modules()
+    if loaded:
+        logger.info(
+            "Feature modules loaded",
+            extra={"features": {name: list(subs) for name, subs in loaded.items()}},
+        )
 
 
 @asynccontextmanager
@@ -84,16 +107,29 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     except Exception:  # noqa: BLE001 - degraded startup is acceptable here
         logger.warning("Redis unavailable at startup; continuing degraded")
 
-    # TODO: build the configured storage and email providers and publish them.
-    # TODO: start the queue consumer / scheduler task group (Stage 2).
-    # TODO: import the modules that register event handlers, so subscriptions
-    # exist before the first request — decorators only run on import.
+    # Providers are built once and published as process-wide singletons.
+    # Building them here rather than per request means a misconfiguration —
+    # an s3 provider with no bucket, an smtp provider with no host — fails the
+    # deploy instead of the first request that happens to need it.
+    set_storage(get_storage_provider())
+    set_email_provider(get_email_provider())
+    logger.info(
+        "Providers ready",
+        extra={
+            "storage": settings.storage.provider,
+            "email": settings.email.provider,
+        },
+    )
 
+    register_event_handlers()
+
+    mark_started()
     logger.info("Startup complete")
 
     try:
         yield
     finally:
+        mark_stopped()
         logger.info("Shutting down %s", settings.app.name)
 
         # Each step is independently guarded: a failure closing one resource

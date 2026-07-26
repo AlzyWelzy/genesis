@@ -29,23 +29,38 @@ from alembic import context
 from sqlalchemy import Connection, pool
 from sqlalchemy.ext.asyncio import async_engine_from_config
 
+# --- Model registration ----------------------------------------------------
+# Every feature's `models` module must be imported before autogenerate runs, or
+# its tables are absent from Base.metadata and the generated migration is
+# silently empty. Discovery does this, so there is no import list to forget.
+# Infrastructure models are not features, so they are imported by name.
+import app.infrastructure.outbox.models  # noqa: F401
 from app.core.config import settings
+from app.core.discovery import import_side_effect_modules
 from app.infrastructure.database.base import Base
 
-# --- Model registration ----------------------------------------------------
-# Import every module's `models` here so its tables register on Base.metadata.
-# Autogenerate only sees what has been imported.
-#
-# TODO: import each app.modules.<feature>.models module as features are added.
-#   from app.modules.billing import models as billing_models
+# Feature models come from discovery; see app/core/discovery.py.
+import_side_effect_modules()
 
 config = context.config
 
 if config.config_file_name is not None:
-    fileConfig(config.config_file_name)
+    # `disable_existing_loggers=False` is essential. The default is True, which
+    # silently disables every logger configured before this point — so running a
+    # migration in-process (a test suite, a startup hook) leaves the application
+    # unable to log anything afterwards, with no error to explain it.
+    fileConfig(config.config_file_name, disable_existing_loggers=False)
 
-# The application is the single source of truth for the connection URL.
-config.set_main_option("sqlalchemy.url", str(settings.database.url))
+# The application settings are the source of truth for the connection URL, so
+# migrations and the app can never disagree about which database they mean.
+#
+# But a caller that has *explicitly* set a URL — the test suite pointing at
+# `genesis_test`, or tooling targeting a replica — must win. Overriding
+# unconditionally is worse than it looks: it silently migrates the development
+# database whenever the suite runs, and the failure surfaces much later as a
+# table that exists in the wrong place.
+if not config.get_main_option("sqlalchemy.url", None):
+    config.set_main_option("sqlalchemy.url", str(settings.database.url))
 
 #: Schema autogenerate diffs the database against.
 target_metadata = Base.metadata

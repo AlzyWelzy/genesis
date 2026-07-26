@@ -155,8 +155,8 @@ class TestSubscription:
         """A sync handler would block the loop for every publisher."""
         with pytest.raises(TypeError, match="must be async"):
 
-            @bus.subscribe(InvoicePaid)
-            def blocking(event: InvoicePaid) -> None:  # ty: ignore[invalid-argument-type]
+            @bus.subscribe(InvoicePaid)  # ty: ignore[invalid-argument-type]
+            def blocking(event: InvoicePaid) -> None:
                 pass
 
     def test_register_is_equivalent_to_the_decorator(self, bus: EventBus) -> None:
@@ -209,9 +209,7 @@ class TestFailureContainment:
 
         assert "Event handler failed" in caplog.text
 
-    async def test_publishing_with_no_handlers_is_a_no_op(
-        self, bus: EventBus
-    ) -> None:
+    async def test_publishing_with_no_handlers_is_a_no_op(self, bus: EventBus) -> None:
         await bus.publish(_invoice_paid())
 
 
@@ -224,9 +222,7 @@ class TestPublishMany:
         async def record(event: DomainEvent) -> None:
             order.append(event.name)
 
-        await bus.publish_many(
-            [UserRegistered(email="a@b.c"), _invoice_paid()]
-        )
+        await bus.publish_many([UserRegistered(email="a@b.c"), _invoice_paid()])
         assert order == ["identity.user_registered", "billing.invoice_paid"]
 
 

@@ -194,3 +194,73 @@ class TestJWKS:
         """A JWKS containing 'd' would publish the signing key itself."""
         for key in build_jwks()["keys"]:
             assert "d" not in key
+
+
+class TestTokenClaims:
+    def test_token_version_is_carried(self) -> None:
+        """This claim is what makes logout-everywhere possible."""
+        claims = decode_token(create_access_token("user-1", token_version=7))
+        assert claims.token_version == 7
+
+    def test_tenant_and_scopes_are_carried(self) -> None:
+        from uuid import uuid7
+
+        tenant_id = uuid7()
+        claims = decode_token(
+            create_access_token("u", tenant_id=tenant_id, scopes=("invoices:read",))
+        )
+        assert claims.tenant_id == tenant_id
+        assert claims.scopes == ("invoices:read",)
+
+    def test_each_token_gets_a_distinct_jti(self) -> None:
+        """A shared jti would make per-token revocation impossible."""
+        assert (
+            decode_token(create_access_token("u")).token_id
+            != decode_token(create_access_token("u")).token_id
+        )
+
+    def test_caller_claims_cannot_override_registered_ones(self) -> None:
+        """Otherwise a caller could forge `sub` through the extra-claims dict."""
+        claims = decode_token(create_access_token("real", claims={"sub": "admin"}))
+        assert claims.subject == "real"
+
+
+class TestTokenRejection:
+    def test_access_token_rejected_where_refresh_expected(self) -> None:
+        from app.core.security import REFRESH_TOKEN_TYPE
+
+        with pytest.raises(InvalidTokenError):
+            decode_token(create_access_token("u"), expected_type=REFRESH_TOKEN_TYPE)
+
+    def test_expired_token_is_rejected(self) -> None:
+        from datetime import timedelta
+
+        from app.core.security import create_token
+
+        expired = create_token(
+            "u", token_type=ACCESS_TOKEN_TYPE, expires_in=timedelta(seconds=-10)
+        )
+        with pytest.raises(InvalidTokenError):
+            decode_token(expired)
+
+    def test_garbage_is_rejected(self) -> None:
+        with pytest.raises(InvalidTokenError):
+            decode_token("not-a-token")
+
+    def test_unknown_kid_is_rejected(self) -> None:
+        """Trying every key on an unknown kid would let an attacker probe them."""
+        import base64
+        import json
+
+        from app.core.config import settings
+
+        _, payload, signature = create_access_token("u").split(".")
+        forged_header = (
+            base64.urlsafe_b64encode(
+                json.dumps({"alg": settings.jwt.algorithm, "kid": "nope"}).encode()
+            )
+            .decode()
+            .rstrip("=")
+        )
+        with pytest.raises(InvalidTokenError):
+            decode_token(f"{forged_header}.{payload}.{signature}")

@@ -1,7 +1,7 @@
 [project]
 name = "genesis"
 version = "0.1.0"
-description = "Add your description here"
+description = "Genesis — a feature-first FastAPI backend skeleton"
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
@@ -22,6 +22,19 @@ dependencies = [
     "uvicorn[standard]>=0.51.0",
 ]
 
+# The project is a real installable package, not a loose directory that happens
+# to sit on the current working directory. Without a build backend, `uv sync`
+# treats the project as "virtual" and never installs it, so `import app` works
+# only when the process was started from the repository root. That is true for
+# `uv run pytest` locally and false in CI — which is exactly the asymmetry that
+# produced `ModuleNotFoundError: No module named 'app'` there and nowhere else.
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["app"]
+
 [project.optional-dependencies]
 # Observability backends are optional so a deployment that does not use them
 # does not carry their dependency trees. Both degrade to no-ops when absent —
@@ -41,6 +54,7 @@ dev = [
     "pre-commit>=4.6.1",
     "pytest>=9.1.1",
     "pytest-asyncio>=1.4.0",
+    "pytest-cov>=7.1.0",
     "ruff>=0.16.0",
     "ty>=0.0.63",
 ]

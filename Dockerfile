@@ -74,9 +74,20 @@ FROM dependencies AS production
 RUN groupadd --system --gid 1001 app \
     && useradd --system --uid 1001 --gid app --no-create-home app
 
-COPY --chown=app:app alembic.ini ./
+COPY --chown=app:app alembic.ini README.md ./
 COPY --chown=app:app migrations ./migrations
 COPY --chown=app:app app ./app
+
+# Install the project itself, now that its source is present. Without this the
+# image works only because uvicorn happens to put the working directory on
+# sys.path — so `docker exec` of any script that cd's elsewhere, and every
+# `python -m` invocation from another directory, fails with ImportError. Only
+# this layer is invalidated by a code change; the dependency layer above is not.
+#
+# --no-editable: an editable install writes a path hook pointing at /app/app,
+# which is correct here but meaningless if the source is ever mounted over.
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --frozen --no-dev --no-editable
 
 USER app
 

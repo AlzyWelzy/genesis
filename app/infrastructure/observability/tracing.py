@@ -60,20 +60,20 @@ def configure_tracing() -> None:
     try:
         # Unresolvable until `uv sync --extra tracing` installs them; the
         # ImportError below is the supported path when they are absent.
-        from opentelemetry import trace  # ty: ignore[unresolved-import]
-        from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import (  # ty: ignore[unresolved-import]
+        from opentelemetry import trace
+        from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import (
             OTLPSpanExporter,
         )
-        from opentelemetry.sdk.resources import (  # ty: ignore[unresolved-import]
+        from opentelemetry.sdk.resources import (
             Resource,
         )
-        from opentelemetry.sdk.trace import (  # ty: ignore[unresolved-import]
+        from opentelemetry.sdk.trace import (
             TracerProvider,
         )
-        from opentelemetry.sdk.trace.export import (  # ty: ignore[unresolved-import]
+        from opentelemetry.sdk.trace.export import (
             BatchSpanProcessor,
         )
-        from opentelemetry.sdk.trace.sampling import (  # ty: ignore[unresolved-import]
+        from opentelemetry.sdk.trace.sampling import (
             ParentBased,
             TraceIdRatioBased,
         )
@@ -152,7 +152,7 @@ def current_trace_id() -> str | None:
     if _provider is None:
         return None
     try:
-        from opentelemetry import trace  # ty: ignore[unresolved-import]
+        from opentelemetry import trace
     except ImportError:
         return None
 

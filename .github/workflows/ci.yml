@@ -15,6 +15,12 @@ concurrency:
 
 env:
   UV_FROZEN: "1"  # fail if uv.lock disagrees with pyproject.toml
+  # Every job syncs with --all-extras. The observability backends are optional
+  # at runtime, but a type checker cannot check an import it cannot resolve and
+  # a test cannot exercise a backend that is not installed. Omitting them here
+  # means the metrics and tracing code paths are checked locally (where a
+  # developer happens to have them) and unchecked in CI — the one place that is
+  # supposed to be authoritative.
 
 jobs:
   # Lint and type-check are separate from tests and run first: they take
@@ -29,7 +35,7 @@ jobs:
         with:
           enable-cache: true
 
-      - run: uv sync --frozen
+      - run: uv sync --frozen --all-extras
 
       - name: Ruff lint
         run: uv run ruff check --output-format=github .
@@ -80,7 +86,7 @@ jobs:
         with:
           enable-cache: true
 
-      - run: uv sync --frozen
+      - run: uv sync --frozen --all-extras
 
       - name: Run tests
         run: uv run pytest --cov=app --cov-report=term-missing --cov-report=xml
@@ -117,7 +123,7 @@ jobs:
         with:
           enable-cache: true
 
-      - run: uv sync --frozen
+      - run: uv sync --frozen --all-extras
 
       - name: Apply migrations
         run: uv run alembic upgrade head
@@ -149,10 +155,17 @@ jobs:
         with:
           enable-cache: true
 
-      - run: uv sync --frozen
-
       - name: Known vulnerabilities in dependencies
-        run: uvx pip-audit --strict --progress-spinner off
+        # Audit an explicit requirements file, not "the current environment".
+        # `uvx` runs pip-audit in its *own* isolated venv, so a bare
+        # `uvx pip-audit` inspects pip-audit's dependencies and reports a clean
+        # bill of health for a project it never looked at — a security gate that
+        # always passes is worse than no gate, because it is trusted.
+        run: |
+          uv export --frozen --all-extras --no-dev --no-emit-project \
+            --output-file requirements-audit.txt
+          uvx pip-audit --requirement requirements-audit.txt \
+            --strict --progress-spinner off
 
       - name: Committed secrets
         # Scans full history, not just the diff: a secret committed once is

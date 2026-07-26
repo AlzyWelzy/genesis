@@ -34,4 +34,7 @@ Dockerfile
 .dockerignore
 .editorconfig
 .pre-commit-config.yaml
-README.md
+# README.md is deliberately NOT excluded. pyproject.toml declares it as the
+# package's long description, so the build backend reads it when the production
+# stage installs the project; excluding it turns `uv sync` into a build failure
+# that only reproduces inside Docker.

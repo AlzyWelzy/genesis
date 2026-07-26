@@ -289,6 +289,19 @@ Before "fixing" any of these, read the comment next to them:
   of what should have happened.
 - **`fileConfig(..., disable_existing_loggers=False)` in `migrations/env.py`.**
   The default silently disables every logger configured before it.
+- **CI syncs with `--all-extras` even though the extras are optional.** A type
+  checker cannot check an import it cannot resolve, and a test cannot exercise a
+  backend that is not installed. Without this, the metrics and tracing paths are
+  checked only on machines that happen to have them.
+- **`pyproject.toml` declares a `[build-system]` for what looks like an
+  application.** Without one, `uv sync` never installs the project, so
+  `import app` works only when the process starts in the repository root. Do not
+  remove it, and do not "fix" the resulting import by adding `pythonpath` to the
+  pytest config — that would paper over the same gap for tests alone.
+- **The CI security job exports a requirements file instead of running
+  `uvx pip-audit` directly.** `uvx` gives pip-audit its own isolated
+  environment, so a bare invocation audits pip-audit's dependencies and passes
+  unconditionally.
 
 ---
 

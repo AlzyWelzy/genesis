@@ -2,93 +2,79 @@
 
 Why this file exists
 --------------------
-Fixtures defined here are visible to every test in the suite, which makes this
-file both powerful and dangerous. It should contain only what genuinely applies
-everywhere: the application instance, the test database and the HTTP client.
+Fixtures defined here are visible to every test, which makes this file both
+powerful and dangerous. It contains only what genuinely applies everywhere:
+key material, an application instance and an HTTP client.
 
-Anything feature-specific belongs in ``tests/modules/<feature>/conftest.py``.
-A fixture added here is imported (and its cost paid) by every test that runs.
+Anything feature-specific belongs in ``tests/modules/<feature>/conftest.py``. A
+fixture added here is paid for by every test that runs.
 
 Isolation strategy
 ------------------
-Each test runs inside a transaction that is rolled back on teardown. Rolling
-back rather than truncating keeps tests fast and, more importantly, order
-independent — no test can observe another's writes, so the suite passes in any
-order and in parallel.
+Database tests run inside a transaction that is rolled back on teardown.
+Rolling back rather than truncating keeps them fast and, more importantly,
+order-independent — no test can observe another's writes, so the suite passes
+in any order. ``pytest-randomly`` shuffles the order every run to keep us
+honest about that.
 """
 
-from collections.abc import AsyncIterator
+from collections.abc import Iterator
+from pathlib import Path
 
 import pytest
+
+from app.core.security import reset_key_cache
 
 
 @pytest.fixture(scope="session")
 def anyio_backend() -> str:
     """Pin async tests to asyncio.
 
-    Without this, anyio-based plugins attempt to parametrise every async test
-    over trio as well, which the application does not support.
+    Without this, anyio-based plugins try to parametrise every async test over
+    trio as well, which the application does not support.
     """
     return "asyncio"
 
 
-@pytest.fixture(scope="session")
-def test_settings() -> object:
-    """Build a ``Settings`` instance pointed at test infrastructure.
+@pytest.fixture(scope="session", autouse=True)
+def _signing_keys(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Path]:
+    """Generate a throwaway Ed25519 key pair for the whole test session.
 
-    Constructed directly rather than read from ``.env`` so a developer's local
-    configuration can never cause a test run to touch a real database.
+    Autouse and session-scoped: token tests must never depend on a developer
+    having run the key-generation script, and must never sign with a real key.
+    Generated once because Ed25519 keygen is cheap but not free.
     """
-    raise NotImplementedError(
-        "Construct app.core.settings.Settings(...) with a dedicated test "
-        "database URL and the console email provider."
-    )
+    from app.core.security import keys as key_module
+    from scripts.generate_keys import generate_key_pair
+
+    key_dir = tmp_path_factory.mktemp("keys")
+    generate_key_pair(key_dir)
+
+    # `settings` is frozen and already built, so redirect the loader at the
+    # throwaway directory rather than trying to mutate configuration.
+    original = key_module._read_pem
+
+    def read_from_tmp(path: Path) -> str:
+        """Resolve any configured key path against the temporary directory."""
+        return original(key_dir / path.name)
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(key_module, "_read_pem", read_from_tmp)
+    reset_key_cache()
+    try:
+        yield key_dir
+    finally:
+        monkeypatch.undo()
+        reset_key_cache()
 
 
-@pytest.fixture(scope="session")
-async def database_engine() -> AsyncIterator[object]:
-    """Create the test database schema once per session.
-
-    Schema creation is expensive; doing it per test would dominate the run.
-    Prefer running the Alembic migrations here over ``metadata.create_all`` —
-    that way the suite also verifies the migrations actually work.
-    """
-    raise NotImplementedError
-
-
-@pytest.fixture
-async def session(database_engine: object) -> AsyncIterator[object]:
-    """Yield a session wrapped in a transaction rolled back after the test.
-
-    Opens an outer transaction, binds the session to it, and rolls back on
-    teardown so nothing the test wrote survives.
-    """
-    raise NotImplementedError
-
-
-@pytest.fixture
-def app(test_settings: object) -> object:
-    """Build the FastAPI application with test settings applied.
-
-    Uses :func:`app.main.create_app` rather than importing the module-level
-    ``app``, so each test session gets an instance built against the test
-    configuration.
-    """
-    raise NotImplementedError
-
-
-@pytest.fixture
-async def client(app: object, session: object) -> AsyncIterator[object]:
-    """Yield an ``httpx.AsyncClient`` bound to the app via ASGITransport.
-
-    Overrides the ``get_session`` dependency with the transactional test
-    session, so writes made through the API are visible to the test and rolled
-    back with it. No network socket is involved.
-    """
-    raise NotImplementedError
-
-
-# TODO: add an `authenticated_client` fixture once an auth module exists.
-# TODO: add a `frozen_time` fixture patching app.common.utils.datetime.utc_now.
-# TODO: add fake Cache / EmailProvider / Queue fixtures so no test can perform
-# real I/O against an external system.
+# TODO (Stage 2, needs a running PostgreSQL):
+#   database_engine — session-scoped; run the Alembic migrations against a test
+#     database so the suite also proves the migrations work.
+#   session — function-scoped; open an outer transaction, bind a session to it,
+#     roll back on teardown.
+#   app / client — build via app.main.create_app() and override the get_session
+#     dependency with the transactional session, so writes made through the API
+#     are visible to the test and discarded with it.
+#   authenticated_client — a client carrying a valid access token.
+#   frozen_time — patch app.common.utils.datetime.utc_now, the single clock read.

@@ -1,0 +1,23 @@
+{#
+  Reference template showing the expected shape. Safe to delete once real
+  templates exist; kept so the rendering path has something to exercise and so
+  the first real template has a pattern to copy.
+#}
+{% extends "_layout.html" %}
+
+{% block content %}
+  <p style="margin:0 0 16px;">Hello {{ recipient_name }},</p>
+  <p style="margin:0 0 16px;">{{ body }}</p>
+  {% if action_url %}
+    <p style="margin:24px 0;">
+      <a href="{{ action_url }}"
+         style="display:inline-block; padding:12px 20px; background-color:#1a1a1a; color:#ffffff; text-decoration:none; border-radius:6px; font-weight:500;">
+        {{ action_label }}
+      </a>
+    </p>
+    <p style="margin:0; font-size:13px; color:#767676;">
+      If the button does not work, paste this into your browser:<br />
+      {{ action_url }}
+    </p>
+  {% endif %}
+{% endblock %}

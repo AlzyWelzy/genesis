@@ -21,13 +21,18 @@ rows) and can skip or repeat rows when the underlying data changes between
 requests. Cursor paging avoids both and is sketched below for feeds and exports.
 """
 
-from collections.abc import Sequence
-from typing import Self
+import base64
+import hashlib
+import hmac
+import json
+from collections.abc import Mapping, Sequence
+from typing import Any, Final, Self
 
 from pydantic import BaseModel, Field
 
 from app.common.constants import DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE
 from app.common.enums import SortOrder
+from app.core.exceptions import ValidationError
 
 
 class PaginationParams(BaseModel):
@@ -139,7 +144,93 @@ class CursorPage[T](BaseModel):
         default=None, description="Pass back as `cursor`; null means last page."
     )
 
+    @classmethod
+    def build(cls, items: Sequence[T], *, next_cursor: str | None = None) -> Self:
+        """Assemble a cursor page."""
+        return cls(items=list(items), next_cursor=next_cursor)
 
-# TODO: implement opaque cursor encode/decode (base64 of the sort key tuple)
-# and sign or version them so a client cannot forge or replay one across a
-# schema change.
+
+# ---------------------------------------------------------------------------
+# Cursor encoding
+# ---------------------------------------------------------------------------
+#
+# A cursor is the sort-key values of the last row on a page, encoded so clients
+# treat it as opaque. Three properties matter, and each is a real failure if
+# missing:
+#
+# * **Opaque** — a client that parses a cursor will depend on its structure,
+#   and the structure is an implementation detail that must stay changeable.
+# * **Versioned** — a cursor minted before a sort-order change is meaningless
+#   afterwards. The version lets it be rejected cleanly rather than silently
+#   returning the wrong window.
+# * **Tamper-evident** — an HMAC stops a client from forging a cursor to probe
+#   arbitrary key ranges. Base64 alone is encoding, not protection.
+
+
+#: Bumped whenever the cursor payload's meaning changes. An older cursor is
+#: then rejected with a clear error instead of paging from the wrong place.
+CURSOR_VERSION: Final[int] = 1
+
+
+def encode_cursor(values: Mapping[str, Any], *, secret: str) -> str:
+    """Encode sort-key values into an opaque, signed cursor.
+
+    Args:
+        values: The last row's sort-key values, e.g.
+            ``{"created_at": "2026-01-15T10:30:00+00:00", "id": "0193..."}``.
+            Must be JSON-representable.
+        secret: Signing secret. Use the application's signing key material, not
+            a literal.
+
+    Returns:
+        A URL-safe cursor string.
+    """
+    payload = json.dumps(
+        {"v": CURSOR_VERSION, "k": dict(values)},
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode()
+    signature = hmac.new(secret.encode(), payload, hashlib.sha256).digest()[:16]
+    return base64.urlsafe_b64encode(payload + b"." + signature).decode().rstrip("=")
+
+
+def decode_cursor(cursor: str, *, secret: str) -> dict[str, Any]:
+    """Decode and verify a cursor produced by :func:`encode_cursor`.
+
+    Args:
+        cursor: The cursor supplied by the client.
+        secret: The same signing secret used to encode it.
+
+    Returns:
+        The sort-key values.
+
+    Raises:
+        ValidationError: When the cursor is malformed, forged, or was minted
+            for an older cursor version. All three are reported as one generic
+            "invalid cursor" so a client cannot distinguish a signature failure
+            from a decode failure and probe the format.
+    """
+    invalid = ValidationError(
+        "Invalid or expired cursor.", code="invalid_cursor"
+    )
+
+    try:
+        padding = "=" * (-len(cursor) % 4)
+        raw = base64.urlsafe_b64decode(cursor + padding)
+        payload, _, signature = raw.rpartition(b".")
+        if not payload:
+            raise invalid
+
+        expected = hmac.new(secret.encode(), payload, hashlib.sha256).digest()[:16]
+        if not hmac.compare_digest(expected, signature):
+            raise invalid
+
+        decoded = json.loads(payload)
+    except ValidationError:
+        raise
+    except Exception as exc:
+        raise invalid from exc
+
+    if decoded.get("v") != CURSOR_VERSION:
+        raise invalid
+    return decoded["k"]

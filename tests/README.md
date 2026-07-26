@@ -35,7 +35,7 @@ them.
 ## What to test at each layer
 
 | Layer | Test | Do not test |
-|---|---|---|
+| --- | --- | --- |
 | `service.py` | Business rules, edge cases, error paths. **Highest value.** | HTTP status codes |
 | `repository.py` | Query correctness, filtering, pagination, eager loading | Business rules |
 | `router.py` | Status codes, response shape, auth enforcement | Business rules again |

@@ -37,7 +37,7 @@ from app.infrastructure.database.base import Base
 # Autogenerate only sees what has been imported.
 #
 # TODO: import each app.modules.<feature>.models module as features are added.
-#   from app.modules.billing import models as billing_models  # noqa: F401
+#   from app.modules.billing import models as billing_models
 
 config = context.config
 

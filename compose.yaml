@@ -1,0 +1,82 @@
+# Local development stack.
+#
+# Brings up PostgreSQL, Redis and the API together so a new developer needs one
+# command, not a page of setup instructions:
+#
+#     docker compose up
+#
+# Data lives in named volumes, so containers can be recreated freely without
+# losing the local database.
+#
+# This file is development only. Production configuration belongs in the
+# orchestrator's manifests — a compose file that tries to serve both ends up
+# serving neither, and the divergence surfaces during an incident.
+
+name: genesis
+
+services:
+  api:
+    build:
+      context: .
+      target: dev
+    ports:
+      - "8000:8000"
+    environment:
+      # Service names resolve over the compose network, so these override the
+      # localhost defaults in .env without editing it.
+      APP__ENVIRONMENT: local
+      APP__DEBUG: "true"
+      DATABASE__URL: postgresql+asyncpg://postgres:postgres@postgres:5432/genesis
+      REDIS__URL: redis://redis:6379/0
+      LOGGING__LEVEL: DEBUG
+    volumes:
+      # Source is mounted, not baked in, so the reloader sees edits immediately.
+      - ./app:/app/app
+      - ./migrations:/app/migrations
+      - ./tests:/app/tests
+      - ./keys:/app/keys:ro
+      # Anonymous volume keeps the image's .venv from being shadowed by the
+      # host's — they are built for different platforms and mixing them
+      # produces import errors that look like corruption.
+      - /app/.venv
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: genesis
+    ports:
+      # Exposed so tests and psql can reach it from the host.
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      # `depends_on` alone only waits for the container to start, not for
+      # PostgreSQL to accept connections — without this the API would race it
+      # and fail its startup check.
+      test: ["CMD-SHELL", "pg_isready -U postgres -d genesis"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:8-alpine
+    # No persistence: local Redis holds cache and rate-limit counters, both of
+    # which are meant to be disposable.
+    command: redis-server --save "" --appendonly no
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  postgres_data:

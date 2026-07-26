@@ -1,0 +1,179 @@
+name: CI
+
+# Runs on every push and PR. The point is that `main` is always deployable, so
+# every gate that would block a deploy runs here — not just the tests.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A new push supersedes an in-flight run for the same ref. Without this, a
+# branch pushed three times queues three full runs and the first two are waste.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  UV_FROZEN: "1"  # fail if uv.lock disagrees with pyproject.toml
+
+jobs:
+  # Lint and type-check are separate from tests and run first: they take
+  # seconds, need no services, and catch the majority of review comments.
+  static:
+    name: Lint and type check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - run: uv sync --frozen
+
+      - name: Ruff lint
+        run: uv run ruff check --output-format=github .
+
+      - name: Ruff format
+        run: uv run ruff format --check .
+
+      - name: Type check
+        run: uv run ty check
+
+      - name: Dependency rule — no inward imports
+        # The architecture's load-bearing constraint. Enforced here because a
+        # rule checked only in review is checked intermittently.
+        run: ./scripts/check_dependency_rule.sh
+
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    services:
+      # Real PostgreSQL, never SQLite — they differ on JSONB, ON CONFLICT and
+      # constraint semantics, which is exactly what the tests exercise.
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: genesis_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s --health-timeout 3s --health-retries 10
+      redis:
+        image: redis:8-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s --health-timeout 3s --health-retries 10
+
+    env:
+      APP__ENVIRONMENT: test
+      DATABASE__URL: postgresql+asyncpg://postgres:postgres@localhost:5432/genesis_test
+      REDIS__URL: redis://localhost:6379/0
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - run: uv sync --frozen
+
+      - name: Run tests
+        run: uv run pytest --cov=app --cov-report=term-missing --cov-report=xml
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage
+          path: coverage.xml
+
+  migrations:
+    name: Migration check
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: genesis_migrations
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s --health-timeout 3s --health-retries 10
+
+    env:
+      APP__ENVIRONMENT: test
+      DATABASE__URL: postgresql+asyncpg://postgres:postgres@localhost:5432/genesis_migrations
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - run: uv sync --frozen
+
+      - name: Apply migrations
+        run: uv run alembic upgrade head
+
+      - name: Detect model drift
+        # Catches the single most common Alembic mistake: a model changed (or
+        # added, and imported in env.py) without a matching migration. The
+        # table is then silently never created, and it fails in staging rather
+        # than here.
+        run: |
+          uv run alembic check || {
+            echo "::error::Models and migrations disagree. Run: uv run alembic revision --autogenerate"
+            exit 1
+          }
+
+      - name: Verify downgrade works
+        # A migration that cannot be rolled back cannot be deployed safely.
+        run: |
+          uv run alembic downgrade base
+          uv run alembic upgrade head
+
+  security:
+    name: Security scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - run: uv sync --frozen
+
+      - name: Known vulnerabilities in dependencies
+        run: uvx pip-audit --strict --progress-spinner off
+
+      - name: Committed secrets
+        # Scans full history, not just the diff: a secret committed once is
+        # compromised even after the commit is reverted.
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  docker:
+    name: Docker build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build production image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: production
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

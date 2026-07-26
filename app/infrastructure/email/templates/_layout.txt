@@ -1,0 +1,15 @@
+{#
+  Shared chrome for the plain-text alternative.
+
+  Never omit the text part: clients that block HTML fall back to it, text-only
+  clients otherwise receive an empty message, and a message with no text
+  alternative scores worse with spam filters.
+#}
+{{ app_name }}
+
+{% block content %}{% endblock %}
+
+--
+{% block footer %}
+You are receiving this because of activity on your {{ app_name }} account.
+{% endblock %}

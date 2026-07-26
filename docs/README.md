@@ -1,7 +1,7 @@
 # Documentation
 
 | Document | Contents |
-|---|---|
+| --- | --- |
 | [`architecture.md`](architecture.md) | The four layers, the request flow, transaction boundaries, and why the structure is what it is |
 
 ## Where documentation lives

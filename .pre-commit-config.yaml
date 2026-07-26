@@ -1,16 +1,72 @@
+# Pre-commit hooks — the fast subset of CI, run before a commit exists.
+#
+# Everything here must complete in seconds. A slow pre-commit hook gets bypassed
+# with `--no-verify`, and a hook that is routinely bypassed is worse than no
+# hook: it creates the belief that checks ran.
+#
+# Tests are deliberately NOT here — they need a database and take too long.
+# CI is the gate for those.
+#
+#     uv run pre-commit install
+#     uv run pre-commit run --all-files
+
 repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      # Formatting hygiene that would otherwise produce whitespace-only diffs.
+      - id: trailing-whitespace
+        args: [--markdown-linebreak-ext=md]
+      - id: end-of-file-fixer
+      - id: mixed-line-ending
+        args: [--fix=lf]
+
+      # Config files that must parse. A broken YAML otherwise reaches CI, and
+      # CI cannot start in order to tell you about it.
+      - id: check-yaml
+      - id: check-toml
+      - id: check-json
+
+      # Refuse to commit a large file. Almost always an accident — a database
+      # dump or a build artefact — and git history is permanent.
+      - id: check-added-large-files
+        args: [--maxkb=1024]
+
+      # Secrets. The private-key hook is the important one: a committed signing
+      # key is a full authentication bypass, and reverting does not undo it.
+      - id: detect-private-key
+      - id: check-merge-conflict
+      - id: debug-statements
+
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.15.2
+    rev: v0.16.0
     hooks:
       - id: ruff-check
-        args: [--fix]
-
+        args: [--fix, --exit-non-zero-on-fix]
       - id: ruff-format
 
   - repo: local
     hooks:
       - id: ty
-        name: ty
+        name: ty (type check)
         entry: uv run ty check
         language: system
+        types: [python]
+        pass_filenames: false
+
+      - id: dependency-rule
+        name: dependency rule (no inward imports)
+        # The architecture's load-bearing constraint. Cheap to check, and it
+        # catches a violation that review reliably misses.
+        entry: scripts/check_dependency_rule.sh
+        language: system
+        pass_filenames: false
+
+      - id: uv-lock-check
+        name: uv.lock matches pyproject.toml
+        # A lockfile that drifts from the manifest means CI and production
+        # resolve a different dependency tree than the developer tested.
+        entry: uv lock --check
+        language: system
+        files: ^(pyproject\.toml|uv\.lock)$
         pass_filenames: false

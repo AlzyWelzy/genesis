@@ -226,3 +226,6 @@ keys/
 
 # Local object storage (STORAGE__PROVIDER=local)
 var/
+
+# Reference production config (no real values)
+!.env.example.production

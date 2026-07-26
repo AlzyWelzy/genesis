@@ -12,10 +12,31 @@ These helpers are storage-agnostic; writing bytes is
 :mod:`app.infrastructure.storage`'s job.
 """
 
+import re
+import unicodedata
 from collections.abc import AsyncIterator
 from pathlib import Path
+from typing import Final
 
 from app.common.constants import STREAM_CHUNK_SIZE
+
+_UNSAFE_FILENAME_CHARS: Final[re.Pattern[str]] = re.compile(r"[^\w.\- ]+")
+_COLLAPSE_DOTS: Final[re.Pattern[str]] = re.compile(r"\.{2,}")
+
+#: Leading bytes identifying common formats. Ordered longest-first so a longer
+#: signature is not shadowed by a shorter prefix.
+_MAGIC_NUMBERS: Final[tuple[tuple[bytes, str], ...]] = (
+    (b"\x89PNG\r\n\x1a\n", "image/png"),
+    (b"GIF87a", "image/gif"),
+    (b"GIF89a", "image/gif"),
+    (b"%PDF-", "application/pdf"),
+    (b"PK\x03\x04", "application/zip"),
+    (b"\xff\xd8\xff", "image/jpeg"),
+    (b"BM", "image/bmp"),
+)
+
+#: Fallback used when nothing else matches and the content is not text.
+_DEFAULT_CONTENT_TYPE: Final[str] = "application/octet-stream"
 
 
 def sanitize_filename(filename: str) -> str:
@@ -23,9 +44,10 @@ def sanitize_filename(filename: str) -> str:
 
     Removes directory components, null bytes, control characters and leading
     dots. An uploaded name containing ``../../etc/passwd`` must never reach the
-    filesystem — and note that even the sanitised result should not be used as
-    a storage key on its own; generate a UUID key and keep this only as display
-    metadata.
+    filesystem.
+
+    Note that even the sanitised result should not be used as a storage key on
+    its own — generate a UUID key and keep this only as display metadata.
 
     Args:
         filename: The name supplied by the client. Untrusted.
@@ -33,7 +55,20 @@ def sanitize_filename(filename: str) -> str:
     Returns:
         A safe basename, never empty.
     """
-    raise NotImplementedError
+    # PurePath handles both separators; take the final component only. Windows
+    # clients send backslashes, which POSIX path handling would not split.
+    basename = filename.replace("\\", "/").split("/")[-1]
+
+    # Drop control characters and anything Unicode classes as a "format" or
+    # "other" character — including the right-to-left override used to disguise
+    # an executable as "photo‮gnp.exe".
+    cleaned = "".join(
+        char for char in basename if unicodedata.category(char)[0] not in ("C", "Z")
+    )
+    cleaned = _UNSAFE_FILENAME_CHARS.sub("_", cleaned)
+    cleaned = _COLLAPSE_DOTS.sub(".", cleaned).strip(". _")
+
+    return cleaned or "unnamed"
 
 
 def get_extension(filename: str) -> str:
@@ -56,9 +91,21 @@ def detect_content_type(header: bytes) -> str | None:
         header: The first few hundred bytes of the file.
 
     Returns:
-        The detected MIME type, or ``None`` when unrecognised.
+        The detected MIME type, or ``None`` when unrecognised. ``None`` means
+        "unknown", so the caller must reject rather than assume.
     """
-    raise NotImplementedError
+    for signature, content_type in _MAGIC_NUMBERS:
+        if header.startswith(signature):
+            return content_type
+
+    # SVG and other XML formats have no fixed magic number. Detect them
+    # explicitly because an SVG is executable in a browser — it can carry
+    # <script> — and must never be served from the application's own origin.
+    prefix = header[:512].lstrip()
+    if prefix.startswith((b"<?xml", b"<svg")) and b"<svg" in header[:512].lower():
+        return "image/svg+xml"
+
+    return None
 
 
 def is_allowed_content_type(content_type: str, allowed: frozenset[str]) -> bool:
@@ -78,8 +125,8 @@ async def stream_chunks(
 ) -> AsyncIterator[bytes]:
     """Re-chunk a byte stream, optionally enforcing a size ceiling.
 
-    Enforcing the limit *while streaming* is the point: checking
-    ``Content-Length`` is not enough, since a client can lie about it or send a
+    Enforcing the limit *while streaming* is the point. Checking
+    ``Content-Length`` is not enough: a client can lie about it, or send a
     chunked body with no length at all.
 
     Args:
@@ -88,14 +135,71 @@ async def stream_chunks(
         max_bytes: Abort once this many bytes have been read.
 
     Yields:
-        Byte chunks.
+        Byte chunks of at most ``chunk_size``.
 
     Raises:
-        ValueError: When ``max_bytes`` is exceeded.
+        ValueError: When ``max_bytes`` is exceeded. Raised as soon as the limit
+            is crossed, so an oversized upload is cut off rather than buffered.
     """
-    raise NotImplementedError
+    buffer = bytearray()
+    total = 0
+
+    async for block in source:
+        total += len(block)
+        if max_bytes is not None and total > max_bytes:
+            raise ValueError(f"Stream exceeded the maximum of {max_bytes} bytes")
+
+        buffer.extend(block)
+        while len(buffer) >= chunk_size:
+            yield bytes(buffer[:chunk_size])
+            del buffer[:chunk_size]
+
+    if buffer:
+        yield bytes(buffer)
 
 
 def human_readable_size(size_bytes: int) -> str:
-    """Format a byte count for humans ("2.4 MB"). For logs and admin UIs."""
-    raise NotImplementedError
+    """Format a byte count for humans, e.g. ``"2.4 MB"``.
+
+    For logs and admin UIs. Uses decimal units (1 kB = 1000 B) to match what
+    operating systems and cloud consoles report.
+
+    Args:
+        size_bytes: The size.
+
+    Returns:
+        The formatted size.
+    """
+    if size_bytes < 1000:
+        return f"{size_bytes} B"
+
+    size = float(size_bytes)
+    for unit in ("kB", "MB", "GB", "TB"):
+        size /= 1000
+        if size < 1000:
+            return f"{size:.1f} {unit}"
+    return f"{size:.1f} PB"
+
+
+def safe_join(root: Path, key: str) -> Path:
+    """Resolve a storage key beneath ``root``, refusing to escape it.
+
+    The check that makes a filesystem-backed store safe. A key containing
+    ``../`` resolves outside the root, which turns "upload a file" into "write
+    anywhere the process can write".
+
+    Args:
+        root: The directory everything must stay inside.
+        key: The relative storage key.
+
+    Returns:
+        The resolved absolute path.
+
+    Raises:
+        ValueError: When the resolved path escapes ``root``.
+    """
+    root_resolved = root.resolve()
+    candidate = (root_resolved / key).resolve()
+    if not candidate.is_relative_to(root_resolved):
+        raise ValueError(f"Path escapes the storage root: {key}")
+    return candidate

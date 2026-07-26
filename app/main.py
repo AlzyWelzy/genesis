@@ -14,9 +14,11 @@ this file tells a new developer the complete boot sequence in under a minute.
 Bootstrap order
 ---------------
 1. Create the ``FastAPI`` instance with metadata and the lifespan handler.
-2. Register middleware (order matters — see :mod:`app.core.middleware`).
+2. Register middleware — order is semantic, see :mod:`app.core.middleware`.
 3. Register exception handlers, so every error shares one envelope.
-4. Include the root API router, which owns every feature route.
+4. Mount the operational routes at the root, outside the API prefix.
+5. Mount the versioned API router, which owns every feature route.
+6. Customise the OpenAPI schema.
 """
 
 from fastapi import FastAPI
@@ -26,6 +28,12 @@ from app.core.config import settings
 from app.core.exceptions import register_exception_handlers
 from app.core.lifespan import lifespan
 from app.core.middleware import register_middleware
+from app.core.openapi import (
+    COMMON_ERROR_RESPONSES,
+    configure_openapi,
+    generate_operation_id,
+)
+from app.system.router import router as system_router
 
 
 def create_app() -> FastAPI:
@@ -45,18 +53,28 @@ def create_app() -> FastAPI:
         docs_url=settings.app.docs_url,
         redoc_url=None,
         openapi_url=settings.app.openapi_url,
+        root_path=settings.app.root_path,
         lifespan=lifespan,
+        # Stable operation IDs: these become method names in generated clients,
+        # so they must not change when a route moves.
+        generate_unique_id_function=generate_operation_id,
+        # Documented once globally rather than on several hundred decorators.
+        responses=COMMON_ERROR_RESPONSES,
     )
 
     register_middleware(app)
     register_exception_handlers(app)
+
+    # Operational routes at the root: orchestrators expect /live and /ready
+    # there, and a probe that 404s because the API prefix changed gets every
+    # replica killed.
+    app.include_router(system_router)
     app.include_router(api_router)
+
+    configure_openapi(app)
 
     return app
 
 
 #: The ASGI callable served by uvicorn (``app.main:app``).
 app = create_app()
-
-# TODO: customise the OpenAPI schema (security schemes, servers, tags metadata)
-# via a `custom_openapi` function assigned to `app.openapi`.

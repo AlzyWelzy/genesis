@@ -84,6 +84,13 @@ class ErrorDetail(BaseSchema):
     details: dict[str, Any] | None = Field(
         default=None, description="Structured context, e.g. per-field errors."
     )
+    request_id: str | None = Field(
+        default=None,
+        description=(
+            "Identifier of the request that failed. Quote this to support: it "
+            "locates the exact log line without the API exposing internals."
+        ),
+    )
 
 
 class ErrorResponse(BaseSchema):

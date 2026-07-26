@@ -6,7 +6,7 @@ that are not part of the HTTP API.
 ## Contents
 
 | Script | Purpose |
-|---|---|
+| --- | --- |
 | [`generate_keys.py`](generate_keys.py) | Generate the Ed25519 JWT signing key pair |
 
 ## Rules

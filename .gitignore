@@ -218,3 +218,11 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+# Signing keys — a committed private key is a full authentication bypass
+keys/
+!keys/README.md
+!keys/.gitkeep
+*.pem
+
+# Local object storage (STORAGE__PROVIDER=local)
+var/

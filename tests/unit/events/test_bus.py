@@ -5,9 +5,10 @@ the publisher does not depend on its subscribers, and a subscriber that can
 fail the publisher's request breaks exactly that guarantee.
 """
 
+import json
 import uuid
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from enum import StrEnum
 from typing import ClassVar
@@ -235,3 +236,76 @@ class TestIsolation:
         assert bus.handler_count(InvoicePaid) == 1
         bus.clear()
         assert bus.handler_count(InvoicePaid) == 0
+
+
+class TestPayloadSerialisation:
+    """``to_payload`` must produce something ``json.dumps`` accepts, always.
+
+    ``date``, ``timedelta`` and ``bytes`` were not handled. All three are
+    ordinary things for a domain event to carry — ``due_date``,
+    ``retention_period``, a digest — and none is JSON-serialisable.
+
+    The failure mode is the reason this matters. Staging such an event to the
+    outbox fails when asyncpg encodes the JSONB column, and that happens *inside*
+    the business transaction — so adding a due date to an event breaks the write
+    the event was describing, at a point that looks nothing like the cause.
+    """
+
+    @staticmethod
+    def _event(value: object) -> DomainEvent:
+        from dataclasses import dataclass
+        from typing import ClassVar
+
+        from app.events.base import DomainEvent
+
+        @dataclass(frozen=True, slots=True, kw_only=True)
+        class Carrier(DomainEvent):
+            name: ClassVar[str] = "test.carrier"
+            val: object
+
+        return Carrier(val=value)
+
+    @pytest.mark.parametrize(
+        ("label", "value", "expected"),
+        [
+            ("date", date(2026, 1, 2), "2026-01-02"),
+            ("timedelta", timedelta(seconds=90), 90.0),
+            ("bytes", b"\xff\xfe", "//4="),
+            ("decimal", Decimal("1.005"), "1.005"),
+        ],
+    )
+    def test_the_value_serialises(
+        self, label: str, value: object, expected: object
+    ) -> None:
+        payload = self._event(value).to_payload()
+
+        json.dumps(payload)  # must not raise
+        assert payload["payload"]["val"] == expected
+
+    def test_a_datetime_keeps_its_time(self) -> None:
+        """``datetime`` subclasses ``date``, so encoder order decides this.
+
+        Matched the wrong way round, every timestamp silently becomes a bare
+        day — a data loss that no exception announces.
+        """
+        moment = datetime(2026, 1, 2, 3, 4, 5, tzinfo=UTC)
+        payload = self._event(moment).to_payload()
+
+        assert payload["payload"]["val"] == "2026-01-02T03:04:05+00:00"
+
+    def test_nested_containers_are_converted_too(self) -> None:
+        payload = self._event({"list": [{"d": date(2026, 1, 1)}]}).to_payload()
+
+        json.dumps(payload)
+        assert payload["payload"]["val"] == {"list": [{"d": "2026-01-01"}]}
+
+    def test_bytes_that_are_not_utf8_still_encode(self) -> None:
+        """A digest or signature is the common case, and rarely valid UTF-8."""
+        payload = self._event(bytes(range(256))).to_payload()
+
+        json.dumps(payload)
+
+    def test_the_envelope_is_always_serialisable(self) -> None:
+        payload = self._event("plain").to_payload()
+
+        assert json.loads(json.dumps(payload))["name"] == "test.carrier"

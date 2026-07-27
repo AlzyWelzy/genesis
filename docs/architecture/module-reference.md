@@ -486,6 +486,27 @@ read-modify-write cannot interleave.
 never learns. `RedisStreamsPubSub` keeps a capped log a reconnecting subscriber
 can resume from, turning "lost on disconnect" into "lost after N messages".
 
+**`events/base.py`** — `to_payload()` guarantees JSON-representable output, and
+`_SCALAR_ENCODERS` is where that guarantee lives. Two things about it are not
+stylistic. **Order matters**: `datetime` is a subclass of `date`, so it must be
+matched first or every timestamp is silently truncated to a bare day — a data
+loss no exception announces. And the table must cover everything a domain event
+plausibly carries — `date`, `timedelta`, `bytes` were all missing — because the
+failure is not local: an unencodable value raises when asyncpg writes the JSONB
+outbox column, *inside* the business transaction, so adding a `due_date` to an
+event breaks the write the event was describing.
+
+**`utils/collections.py`** — `deep_merge` copies nested containers rather than
+aliasing them. "Does not mutate its inputs" and "the result is safe to mutate"
+are different properties, and only the first is obvious. A shallow `dict(base)`
+satisfies the first while leaving every nested dict shared, so::
+
+    config = deep_merge(DEFAULTS, overrides)
+    config["db"]["host"] = "localhost"
+
+rewrites `DEFAULTS` for the life of the process. Configuration merging is
+precisely where a shared default is the base.
+
 **`pagination.py`** — cursors are opaque, versioned and HMAC-signed. The
 signature is appended with **no delimiter** and split off by its fixed length.
 That is not a style choice: v1 separated payload from signature with `.` and

@@ -19,11 +19,13 @@ transaction. Events describe the past and cannot be "cancelled" by a handler —
 a validation check must be a direct call, not a listener.
 """
 
+import base64
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field, fields
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from enum import Enum
+from types import UnionType
 from typing import Any, ClassVar
 from uuid import UUID, uuid7
 
@@ -108,11 +110,29 @@ class DomainEvent:
 #: Scalar conversions applied by :func:`_to_jsonable`. ``Decimal`` becomes a
 #: string, never a float: binary floats cannot represent decimal fractions
 #: exactly, and an event carrying money must round-trip to the cent.
-_SCALAR_ENCODERS: tuple[tuple[type, Callable[[Any], Any]], ...] = (
+#:
+#: **Order matters.** ``datetime`` is a subclass of ``date``, so it must be
+#: matched first or every timestamp would be truncated to a bare day — a silent
+#: loss of the time component, which is far worse than a crash.
+#:
+#: ``date`` and ``timedelta`` are here because they are ordinary things for a
+#: domain event to carry (``due_date``, ``retention_period``) and neither is
+#: JSON-serialisable. Left out, staging such an event to the outbox fails when
+#: asyncpg encodes the JSONB column — which happens *inside* the business
+#: transaction, so adding a due date to an event breaks the write it describes.
+# The key may be a union (``bytes | bytearray``), which ``isinstance`` accepts
+# and is narrower to read than two entries sharing one encoder.
+_SCALAR_ENCODERS: tuple[tuple[type | UnionType, Callable[[Any], Any]], ...] = (
     (datetime, lambda value: value.isoformat()),
+    (date, lambda value: value.isoformat()),
+    (timedelta, lambda value: value.total_seconds()),
     (UUID, str),
     (Decimal, str),
     (Enum, lambda value: value.value),
+    # Base64 rather than a decode attempt: bytes in an event are usually a
+    # digest or a signature, and `.decode()` would raise on the first one that
+    # is not valid UTF-8.
+    (bytes | bytearray, lambda value: base64.b64encode(value).decode("ascii")),
 )
 
 

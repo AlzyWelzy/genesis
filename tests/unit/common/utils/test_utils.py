@@ -250,6 +250,58 @@ class TestCollections:
         cols.deep_merge(base, {"a": {"y": 2}})
         assert base == {"a": {"x": 1}}
 
+    def test_the_result_shares_no_nested_structure_with_the_base(self) -> None:
+        """The bug this catches, which "does not mutate" above did not.
+
+        A shallow ``dict(base)`` leaves every nested dict aliased. The merge
+        itself then looks correct — the assertion above passes — and the damage
+        happens later, when a caller mutates the result::
+
+            config = deep_merge(DEFAULTS, overrides)
+            config["db"]["host"] = "localhost"
+
+        which rewrites ``DEFAULTS`` for the life of the process. Merging
+        configuration is exactly where a shared default is the base.
+        """
+        base = {"db": {"host": "prod", "nested": {"deep": 1}}}
+        merged = cols.deep_merge(base, {"flags": {"on": True}})
+
+        merged["db"]["host"] = "localhost"
+        merged["db"]["nested"]["deep"] = 99
+
+        assert base == {"db": {"host": "prod", "nested": {"deep": 1}}}
+
+    def test_the_result_shares_no_nested_structure_with_the_override(self) -> None:
+        """The same hazard from the other side."""
+        override = {"db": {"host": "local"}}
+        merged = cols.deep_merge({}, override)
+
+        merged["db"]["host"] = "mutated"
+
+        assert override == {"db": {"host": "local"}}
+
+    def test_lists_in_the_result_are_copies_too(self) -> None:
+        """A replaced list is still a shared object unless it is copied."""
+        base = {"items": [{"x": 1}]}
+        merged = cols.deep_merge(base, {})
+
+        merged["items"][0]["x"] = 99
+        merged["items"].append("new")
+
+        assert base == {"items": [{"x": 1}]}
+
+    def test_merged_branches_are_also_independent(self) -> None:
+        """Both sides contributed, so both must be safe from the result."""
+        base = {"a": {"x": {"deep": 1}}}
+        override = {"a": {"y": {"deep": 2}}}
+        merged = cols.deep_merge(base, override)
+
+        merged["a"]["x"]["deep"] = 99
+        merged["a"]["y"]["deep"] = 99
+
+        assert base == {"a": {"x": {"deep": 1}}}
+        assert override == {"a": {"y": {"deep": 2}}}
+
     def test_compact_drops_none_but_keeps_falsy(self) -> None:
         assert cols.compact({"a": 1, "b": None, "c": 0, "d": ""}) == {
             "a": 1,

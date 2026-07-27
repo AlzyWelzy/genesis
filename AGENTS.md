@@ -336,6 +336,15 @@ Before "fixing" any of these, read the comment next to them:
   before the transport runs, so holding it through a failure suppresses the
   queue retry the guard exists to enable — turning "the user gets a duplicate"
   into "the password reset never arrives".
+- **`_SCALAR_ENCODERS` order is load-bearing.** `datetime` subclasses `date`,
+  so it must be matched first or every timestamp is silently truncated to a bare
+  day. Add new types to the table rather than special-casing at a call site: an
+  unencodable value fails when asyncpg writes the JSONB outbox column, which is
+  *inside* the business transaction.
+- **`deep_merge` copies nested containers.** A shallow `dict(base)` leaves them
+  aliased, so mutating the merged config rewrites the shared defaults it came
+  from. "Does not mutate its inputs" is not the same property as "the result is
+  safe to mutate".
 - **A cursor's signature is split off by *length*, never by a delimiter.** The
   signature is raw HMAC bytes and can contain any byte, including whatever you
   chose as a separator — v1 used `.` with `rpartition`, and ~7% of cursors were

@@ -131,23 +131,52 @@ def deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]
     **including lists**. Merging lists has no single obvious meaning (append?
     union? by index?), so replacement is the predictable choice.
 
-    Neither input is modified.
+    Neither input is modified, and — the part that is easy to get wrong — the
+    result **shares no mutable structure with either input**. A shallow
+    ``dict(base)`` leaves every nested dict aliased, so a caller doing the
+    obvious thing::
+
+        config = deep_merge(DEFAULTS, request_overrides)
+        config["db"]["host"] = "localhost"
+
+    would rewrite ``DEFAULTS`` for the life of the process, and every later
+    caller would inherit it. Merging configuration is exactly where a shared
+    default is the base, which is exactly where that is worst.
+
+    Nested containers are therefore copied. Scalars are left alone, being
+    immutable, so the cost stays proportional to the nesting rather than to a
+    blanket ``deepcopy`` of arbitrary objects.
 
     Args:
         base: The starting mapping.
         override: Values that win on conflict.
 
     Returns:
-        A new merged mapping.
+        A new merged mapping, safe to mutate.
     """
-    merged = dict(base)
+    merged: dict[str, Any] = {key: _copied(value) for key, value in base.items()}
     for key, value in override.items():
         existing = merged.get(key)
         if isinstance(existing, dict) and isinstance(value, dict):
             merged[key] = deep_merge(existing, value)
         else:
-            merged[key] = value
+            merged[key] = _copied(value)
     return merged
+
+
+def _copied(value: Any) -> Any:
+    """Return a value with its mutable containers copied one level deeper.
+
+    Recurses through dicts and lists; everything else is returned as-is because
+    it is either immutable or not ours to duplicate. Deliberately narrower than
+    :func:`copy.deepcopy`, which would also try to clone database sessions,
+    open files and anything else that found its way into a config mapping.
+    """
+    if isinstance(value, dict):
+        return {key: _copied(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_copied(item) for item in value]
+    return value
 
 
 def compact[K: Hashable, V](mapping: dict[K, V | None]) -> dict[K, V]:

@@ -27,7 +27,11 @@ from redis.asyncio import Redis
 
 from app.core.config import settings
 from app.core.logging import get_logger
-from app.infrastructure.redis.client import build_key, get_redis
+from app.infrastructure.redis.client import (
+    blocking_read_ms,
+    build_key,
+    get_redis,
+)
 
 logger = get_logger(__name__)
 
@@ -229,7 +233,7 @@ class RedisStreamsPubSub:
             # redis-py types the streams mapping more narrowly than it
             # accepts; a dict[str, str] is valid at runtime.
             response = await client.xread(  # ty: ignore[no-matching-overload]
-                streams, block=5000, count=100
+                streams, block=blocking_read_ms(), count=100
             )
             if not response:
                 continue

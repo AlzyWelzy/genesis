@@ -335,7 +335,20 @@ class RedisSettings(BaseModel):
     #: Default TTL (seconds) when a cache write omits one.
     default_ttl_seconds: int = 300
 
+    #: Connections the pool may open. The pool **waits** for a free connection
+    #: rather than failing, so this caps concurrency instead of capping success.
     max_connections: int = 20
+
+    #: How long a caller waits for a free connection before giving up.
+    #:
+    #: Must be greater than zero. A pool that raises the moment it is empty
+    #: turns every Redis-backed control into a no-op under load, because they
+    #: all fail open by design: the rate limiter admits the request, the email
+    #: guard sends the duplicate, the cache reports a miss. That inverts the
+    #: rate limiter in particular — an attacker only needs enough concurrency
+    #: to exhaust the pool, and the limit stops applying exactly when it is
+    #: most needed.
+    pool_timeout_seconds: float = 10.0
     socket_timeout_seconds: float = 5.0
 
 

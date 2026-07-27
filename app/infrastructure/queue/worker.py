@@ -42,7 +42,11 @@ from app.infrastructure.queue.client import (
     DeliveredJob,
     TaskRegistry,
 )
-from app.infrastructure.redis.client import build_key, get_redis
+from app.infrastructure.redis.client import (
+    blocking_read_ms,
+    build_key,
+    get_redis,
+)
 
 logger = get_logger(__name__)
 
@@ -200,7 +204,11 @@ class Worker:
                 self.name,
                 {build_key(STREAM_KEY): ">"},
                 count=self.concurrency,
-                block=5000,  # ms; an idle worker blocks rather than spinning
+                # Derived from the socket timeout, never hard-coded: a block
+                # as long as the client's own read deadline means the client
+                # times out first and every idle poll raises. See
+                # `blocking_read_ms`.
+                block=blocking_read_ms(),
             ),
         )
         if not response:

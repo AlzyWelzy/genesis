@@ -299,6 +299,34 @@ first version asserted something the function never promised.
 
 ---
 
+## 9c. Concurrency tests
+
+`tests/concurrency/` runs operations *against each other*, against real
+PostgreSQL and Redis. It exists because every guarantee this platform makes has
+a concurrent clause that a sequential test cannot see:
+
+| Mechanism | Only meaningful concurrently |
+|---|---|
+| `FOR UPDATE SKIP LOCKED` | Two relays share the outbox instead of double-publishing |
+| Consumer group | Two workers split a stream instead of both running a job |
+| `SET NX` | Two producers racing one idempotency key produce one job |
+| Version column | The second of two editors refetches instead of overwriting |
+| Blocking pool | A burst waits instead of bypassing the rate limiter |
+
+Run the operations one after another and the code passes whether or not any of
+that is wired up.
+
+**Rules for writing them.** Use genuinely separate sessions or clients —
+"concurrent" work sharing one session is serialised by it and proves nothing.
+Use `asyncio.Event` to force a specific interleaving; a `sleep` in its place is a
+coin flip that passes locally and fails in CI. Never fake Redis or PostgreSQL
+here: the guarantees under test are *theirs*.
+
+**Exceed the pool size** when testing anything Redis-backed. Below
+`max_connections` every one of these tests passes on a broken pool.
+
+---
+
 ## 10. Things that look wrong but are not
 
 Before "fixing" any of these, read the comment next to them:
@@ -373,6 +401,16 @@ Before "fixing" any of these, read the comment next to them:
   aliased, so mutating the merged config rewrites the shared defaults it came
   from. "Does not mutate its inputs" is not the same property as "the result is
   safe to mutate".
+- **The Redis pool is a `BlockingConnectionPool`, not a `ConnectionPool`.** The
+  plain pool raises the instant it is exhausted, and every Redis-backed control
+  here fails open — so past `max_connections` concurrent operations the rate
+  limiter, the email guard and the cache all stop working together, silently.
+  For the rate limiter that is an inversion: enough concurrency defeats it.
+- **`blocking_read_ms()` derives the block from the socket timeout.** A blocking
+  read longer than the client's own read deadline makes the client time out
+  first — so an idle worker raised on *every* poll and logged a traceback every
+  few seconds. Never hard-code a block duration, and never add a constant floor:
+  a floor re-creates the bug below twice its value.
 - **A cursor's signature is split off by *length*, never by a delimiter.** The
   signature is raw HMAC bytes and can contain any byte, including whatever you
   chose as a separator — v1 used `.` with `rpartition`, and ~7% of cursors were

@@ -20,7 +20,7 @@ that failure is invisible, because a cache hit looks identical either way.
 
 from typing import Any
 
-from redis.asyncio import ConnectionPool, Redis
+from redis.asyncio import BlockingConnectionPool, ConnectionPool, Redis
 
 from app.core.config import settings
 from app.core.logging import get_logger
@@ -53,9 +53,24 @@ async def init_redis() -> Redis:
     if _client is not None:
         return _client
 
-    pool = ConnectionPool.from_url(
+    # A *blocking* pool: a caller finding it empty waits for a connection to be
+    # returned rather than raising immediately.
+    #
+    # The plain `ConnectionPool` raises `MaxConnectionsError` the moment it is
+    # exhausted, and every Redis-backed control in this codebase fails open by
+    # design — the rate limiter admits the request, the email guard sends the
+    # duplicate, the cache reports a miss. So past `max_connections` concurrent
+    # operations they all quietly stop working *together*, and the rate limiter
+    # inverts completely: an attacker needs only enough concurrency to drain the
+    # pool, and the limit stops applying exactly when it exists to apply.
+    #
+    # Waiting converts that into backpressure, which is the correct behaviour
+    # under load and is visible in latency rather than silent in a log nobody
+    # reads.
+    pool = BlockingConnectionPool.from_url(
         str(settings.redis.url),
         max_connections=settings.redis.max_connections,
+        timeout=settings.redis.pool_timeout_seconds,
         socket_timeout=settings.redis.socket_timeout_seconds,
         socket_connect_timeout=settings.redis.socket_timeout_seconds,
         decode_responses=False,
@@ -116,6 +131,42 @@ async def close_redis() -> None:
     if _pool is not None:
         await _pool.aclose()
         _pool = None
+
+
+def blocking_read_ms() -> int | None:
+    """How long a blocking Redis read may wait, in milliseconds.
+
+    Returns ``None`` when the configured socket timeout leaves no room to block
+    safely; redis-py then omits ``BLOCK`` and the read returns immediately.
+    Returning ``0`` would be actively dangerous — to Redis, ``BLOCK 0`` means
+    *block forever*, so the smallest configured timeout would produce the
+    longest possible wait.
+
+    A blocking command (``XREADGROUP``, ``XREAD``, ``BRPOP``) holds the
+    connection open for its whole duration while the *client* applies its own
+    socket read deadline. If the block is not comfortably shorter than that
+    deadline, the client gives up before the server answers and every call
+    raises ``redis.TimeoutError``.
+
+    With both set to five seconds that is not an edge case — it is every single
+    idle poll. The worker's loop caught the error, logged a full traceback and
+    slept, so an idle worker emitted an ERROR every few seconds forever: the
+    opposite of the "an idle worker blocks rather than spinning" behaviour it was
+    written to have, and enough log noise to bury a real failure completely.
+
+    Derived from the configured timeout rather than hard-coded, so lowering
+    ``REDIS__SOCKET_TIMEOUT_SECONDS`` cannot silently reintroduce the collision.
+
+    Half the budget, with no floor. A floor is the tempting addition and it is
+    wrong: any constant lower bound is itself a hard-coded duration, and it
+    re-creates the original bug the moment someone configures a timeout below
+    twice that constant. A very short socket timeout does mean frequent polling,
+    but that is the operator's explicit choice and is strictly better than
+    raising on every read.
+    """
+    budget_ms = int(settings.redis.socket_timeout_seconds * 1000)
+    half = budget_ms // 2
+    return half if half >= 1 else None
 
 
 def build_key(*parts: Any) -> str:

@@ -151,3 +151,50 @@ merges or signs. Good properties are relationships, not restatements:
 
 Keep I/O out. Hypothesis calls a test hundreds of times; anything touching
 PostgreSQL or Redis belongs in `tests/integration/`.
+
+
+## Concurrency tests
+
+`tests/concurrency/` is the third layer, and it reaches what neither of the
+others can. Example tests fix the input; property tests generate the input;
+neither can express *two things happening at once*.
+
+That matters because every guarantee this platform makes has a concurrent
+clause, and the clause is the whole point of the mechanism:
+
+| Mechanism | The guarantee | Sequentially |
+|---|---|---|
+| `FOR UPDATE SKIP LOCKED` | Two relays share the outbox | Passes with or without it |
+| Consumer group | Two workers split a stream | Passes either way |
+| `SET NX` | One winner per idempotency key | Passes either way |
+| Version column | The loser refetches | Passes either way |
+| Blocking pool | A burst waits, not bypasses | Passes either way |
+
+Two bugs surfaced here that nothing else could have found:
+
+**The Redis pool failed open under load.** `ConnectionPool` raises
+`MaxConnectionsError` the moment it is exhausted, and every Redis-backed control
+in this codebase fails open by design — the rate limiter admits, the email guard
+sends, the cache misses. So beyond `max_connections` concurrent operations they
+all stopped working *together*. For the rate limiter that is not degradation but
+inversion: an attacker needs only enough concurrency to drain the pool, and the
+limit stops applying exactly when it exists to apply. Now a
+`BlockingConnectionPool`, which applies backpressure — visible as latency rather
+than silent in a log.
+
+**Every idle worker poll raised.** `XREADGROUP` blocked for 5000ms while the
+client's socket deadline was 5.0s, so the client gave up first on *every* poll of
+an empty queue. The worker logged a full traceback and slept, forever. Invisible
+to any test that enqueues a job first, because then the read returns immediately
+and never reaches its block duration.
+
+### Writing them
+
+* **Separate sessions and clients.** Work sharing one session is serialised by
+  it, so the test passes on code that would deadlock or double-write.
+* **`asyncio.Event`, not `sleep`,** when a race needs a specific interleaving. A
+  sleep is a coin flip that passes on a fast machine and fails in CI.
+* **Real PostgreSQL and Redis.** The guarantees under test are theirs; a fake
+  asserts only that we called the methods we thought we called.
+* **Exceed the pool size.** Below `max_connections`, every Redis test passes on a
+  broken pool — which is exactly how that bug survived.

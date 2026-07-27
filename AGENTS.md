@@ -336,6 +336,11 @@ Before "fixing" any of these, read the comment next to them:
   before the transport runs, so holding it through a failure suppresses the
   queue retry the guard exists to enable — turning "the user gets a duplicate"
   into "the password reset never arrives".
+- **`get_session` and `session_scope` publish buffered events themselves.** Do
+  not call `flush_pending_events` after a commit as well — it would be a no-op,
+  but the reason it is wired into the session helpers matters: leaving it to
+  each caller means a forgotten call is *invisible*. The transaction commits,
+  the request returns 200, and no handler runs, with nothing raised or logged.
 
 ---
 

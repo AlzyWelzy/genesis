@@ -241,9 +241,18 @@ def _pending_events(session: AsyncSession) -> list[DomainEvent]:
 async def flush_pending_events(session: AsyncSession) -> int:
     """Publish the events buffered on a session, after its commit.
 
-    Call this immediately after ``session.commit()``. Buffered events are
-    cleared before publication, so a handler that raises cannot cause the same
-    event to be published twice on a later flush.
+    **Called for you.** Both session entry points —
+    :func:`~app.infrastructure.database.session.get_session` for requests and
+    :func:`~app.infrastructure.database.session.session_scope` for workers and
+    scripts — invoke this once the transaction has committed. Wiring it there
+    rather than leaving it to each caller is deliberate: a forgotten call is
+    invisible. The transaction commits, the request returns 200, and no handler
+    ever runs, with nothing raised and nothing logged.
+
+    Call it directly only when managing a session outside those two paths.
+
+    Buffered events are cleared before publication, so a handler that raises
+    cannot cause the same event to be published twice on a later flush.
 
     Returns:
         How many events were published.

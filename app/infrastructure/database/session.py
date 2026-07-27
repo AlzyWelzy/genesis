@@ -94,12 +94,33 @@ session_factory: async_sessionmaker[AsyncSession] = async_sessionmaker(
 )
 
 
+async def _publish_buffered_events(session: AsyncSession) -> None:
+    """Deliver events staged with ``publish_after_commit(durable=False)``.
+
+    Imported here rather than at module scope: ``app.infrastructure.outbox``
+    imports this module, and the event bus reaches the outbox on its durable
+    path, so a top-level import closes a cycle.
+
+    Handler failures are already contained by ``EventBus.publish`` and logged
+    there, so this cannot turn a successful transaction into a failed request.
+    """
+    from app.events.bus import flush_pending_events  # noqa: PLC0415 - cycle
+
+    await flush_pending_events(session)
+
+
 async def get_session() -> AsyncIterator[AsyncSession]:
     """FastAPI dependency yielding a request-scoped session.
 
     One session per request, closed when the response is finished. Nothing is
     committed here: a request that raises must not persist partial writes, and
     a request that succeeds commits explicitly in the service layer.
+
+    Buffered domain events are published after the handler returns — which is
+    necessarily after the service committed, satisfying
+    :func:`~app.events.bus.publish_after_commit`'s ordering requirement. A
+    request that raised rolls back and publishes nothing, because a subscriber
+    must never react to something that did not happen.
 
     Yields:
         The session bound to this request.
@@ -110,6 +131,7 @@ async def get_session() -> AsyncIterator[AsyncSession]:
         except Exception:
             await session.rollback()
             raise
+        await _publish_buffered_events(session)
 
 
 @asynccontextmanager
@@ -119,6 +141,9 @@ async def session_scope() -> AsyncIterator[AsyncSession]:
     For queue consumers, scheduled jobs and scripts, where no dependency
     injection is available. Commits on success and rolls back on failure —
     appropriate because here the caller *is* the unit of work.
+
+    Publishes buffered domain events after the commit succeeds, for the same
+    reason :func:`get_session` does.
 
     Yields:
         A session wrapping a single transaction.
@@ -130,6 +155,7 @@ async def session_scope() -> AsyncIterator[AsyncSession]:
         except Exception:
             await session.rollback()
             raise
+        await _publish_buffered_events(session)
 
 
 async def check_database_health() -> bool:

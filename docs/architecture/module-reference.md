@@ -406,6 +406,14 @@ closes that window; `default=` remains the backstop for paths that bypass
 explicitly supplied ID (a restore, a cross-environment import) still wins.
 
 **`session.py`** — one engine per process, one session per unit of work.
+
+Both entry points publish buffered domain events after the transaction settles:
+`get_session` once the request handler returns (necessarily after the service
+committed), `session_scope` after its own commit. Neither publishes on the
+rollback path, because a subscriber reacting to something that did not happen is
+worse than one that missed it. This is wired here rather than left to callers
+because a forgotten `flush_pending_events` is invisible — the commit succeeds,
+the response is a 200, and no handler ever runs.
 `expire_on_commit=False` matters specifically for async: the default triggers a
 lazy refresh on attribute access after commit, which raises `MissingGreenlet`
 outside an await context.

@@ -95,6 +95,31 @@ async def claim_send(message: EmailMessage) -> bool:
     return bool(claimed)
 
 
+async def release_send_claim(message: EmailMessage) -> None:
+    """Give back a claim whose send did not happen.
+
+    Without this the guard inverts into the failure it exists to prevent. The
+    claim is taken *before* the transport runs, so a send that then fails leaves
+    the key in place for the whole idempotency window — and the queue's retry,
+    the entire reason the guard is needed, is suppressed. A transient SMTP error
+    stops being "the user gets a duplicate" and becomes "the password reset
+    never arrives", silently, for hours.
+
+    Best effort. A failed release costs a suppressed retry, which is exactly
+    where things stood before, so it is logged rather than raised — the caller
+    is already unwinding a more important error.
+    """
+    key = build_key("email:sent", message_idempotency_key(message))
+    try:
+        await get_redis().delete(key)
+    except Exception:  # noqa: BLE001 - already unwinding a more important error
+        logger.warning(
+            "Could not release the email idempotency claim; the retry will be "
+            "suppressed until it expires",
+            extra={"template": message.template},
+        )
+
+
 @lru_cache(maxsize=1)
 def _environment() -> Environment:
     """Build and cache the Jinja environment.
@@ -269,17 +294,25 @@ class SMTPEmailProvider:
                 if prepared is None or not await claim_send(prepared):
                     continue
 
-                message = prepared
-                html, text = render_template(message.template, message.context)
-                mime = build_mime(message, html, text)
-                await client.send_message(
-                    mime, recipients=[*message.to, *message.cc, *message.bcc]
-                )
+                try:
+                    html, text = render_template(prepared.template, prepared.context)
+                    mime = build_mime(prepared, html, text)
+                    await client.send_message(
+                        mime,
+                        recipients=[*prepared.to, *prepared.cc, *prepared.bcc],
+                    )
+                except Exception:
+                    # This message did not go out, so it must not stay claimed.
+                    # Holding the claim through a failure suppresses the very
+                    # retry that is supposed to recover it.
+                    await release_send_claim(prepared)
+                    raise
+
                 logger.info(
                     "Email sent",
                     extra={
-                        "email_to": message.to,
-                        "email_template": message.template,
+                        "email_to": prepared.to,
+                        "email_template": prepared.template,
                     },
                 )
         except Exception as exc:

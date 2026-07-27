@@ -388,6 +388,23 @@ index locality, without a sequential key's enumerability), `TimestampMixin`
 `AuditMixin` deliberately uses no foreign key: an audit trail must survive the
 deletion of the user it names.
 
+`UUIDPrimaryKeyMixin` carries **both** a `default=uuid7` and an `init` event
+listener, which is not redundancy. `default=` is an *insert* default: SQLAlchemy
+evaluates it while flushing, so `Invoice().id` is `None` until then. Code doing
+the thing the mixin exists to enable —
+
+```python
+invoice = Invoice(...)
+await stage(session, InvoicePaid(invoice_id=invoice.id))  # None, silently
+await repo.add(invoice)
+```
+
+— stages an event carrying `None`, with no error, because the column is happy to
+be populated a moment later. The listener assigns the ID at construction and
+closes that window; `default=` remains the backstop for paths that bypass
+`__init__`, such as a bulk `insert()`. The listener uses `setdefault`, so an
+explicitly supplied ID (a restore, a cross-environment import) still wins.
+
 **`session.py`** — one engine per process, one session per unit of work.
 `expire_on_commit=False` matters specifically for async: the default triggers a
 lazy refresh on attribute access after commit, which raises `MissingGreenlet`
@@ -404,6 +421,16 @@ review and greppable.
 `session.get()` bypasses both tenant and soft-delete scoping — making it a
 cross-tenant read by primary key.
 
+`TenantRepository.add()` *overwrites* `tenant_id` rather than defaulting it. A
+`tenant_id` deserialised from a request body is a cross-tenant write, and
+stamping centrally is what makes the field impossible to influence from outside.
+
+Covered by `tests/integration/test_repository.py`, which declares its models on
+the real `Base` so they inherit the real naming convention and type mapping.
+Their `_test_` prefix keeps them out of autogenerate (see `_include_object` in
+`migrations/env.py`), and their tables are created inside the test's transaction,
+so the rollback drops them.
+
 ### `infrastructure/redis/`
 
 **`client.py`** — one pool for cache, pub/sub, queue and rate limiting.
@@ -413,15 +440,35 @@ staging deploy silently reads production cache entries.
 The client is **bound to the event loop that created it**. Anything creating a
 fresh loop must `close_redis()` first.
 
+`init_redis()` publishes the module globals only **after** the ping succeeds.
+Assigning first and pinging second looks equivalent and is not: a failed ping
+leaves a broken client cached, so the next call takes the "already initialised"
+early return and reports success without ever pinging. Startup then proceeds
+against a Redis that is not there, and the failure resurfaces later, at the point
+of use, with nothing connecting it back to the cause.
+
 **`cache.py`** — JSON, never pickle: unpickling attacker-controlled bytes is
 arbitrary code execution. Read failures are swallowed and logged as misses,
 because an unavailable cache should make the application slower, never broken.
 `clear_prefix` uses `SCAN`, never `KEYS`, which blocks the entire Redis instance.
 
 **`rate_limit.py`** — sliding window by default. A fixed window permits a burst
-of 200 spanning the boundary, which is exactly the shape the limit prevents.
-Redis operations run in one atomic pipeline; the sorted-set member includes a
-random suffix so two requests in the same millisecond do not collapse into one.
+of 200 spanning the boundary, which is exactly the shape the limit prevents. The
+sorted-set member includes a random suffix so two requests in the same
+millisecond do not collapse into one.
+
+The window check is a Lua script rather than a pipeline, for two reasons. A
+pipeline groups round trips, but the *decision* still happens in Python, between
+the count coming back and the entry going in — so two concurrent requests at the
+boundary both read the same count and both proceed. And a rejected request must
+**not** be recorded: recording it means a client that retries while blocked keeps
+pushing its own window forward and never recovers, staying locked out until it
+stops entirely for a full window, which a polling client never does. The lockout
+is effectively permanent and looks, from outside, like the limiter is broken.
+
+`reset_after` is measured from the oldest entry still in the window, not assumed
+to be a whole window. A flat window length tells a client to wait far longer than
+it needs to, which reads as a much harsher limit than the one configured.
 
 Token bucket (`check_token_bucket`) for endpoints where a short burst is
 legitimate but a high sustained rate is not. Implemented as a Lua script so
@@ -432,6 +479,22 @@ never learns. `RedisStreamsPubSub` keeps a capped log a reconnecting subscriber
 can resume from, turning "lost on disconnect" into "lost after N messages".
 
 ### `infrastructure/storage/`
+
+`presigned_url` / `verify_presigned` sign with `url_signing_secret()`, which
+prefers `SECURITY__URL_SIGNING_KEY` and otherwise derives a key from the JWT
+private key through HMAC with a domain separator. A presigned URL *is* the
+authorisation — possession of it is the whole check — so signing with a service
+name, namespace or any other publicly known value is not a weak signature, it is
+no signature at all: anyone can mint a link for an arbitrary key with an
+arbitrary expiry. Deriving keeps local development correct with no configuration;
+set the key explicitly where links must outlive a signing-key rotation.
+
+`S3StorageProvider.exists()` treats only a 404 (or `NoSuchKey` / `NotFound`) as
+absence and re-raises everything else as `ExternalServiceError`. Reporting every
+failure as "not there" means an outage, an expired credential or a bucket-policy
+change makes every object appear missing — an "upload if absent" flow then
+silently overwrites live data, and a read path returns 404 when the honest answer
+is that storage is down and a retry would work.
 
 Protocol plus local and S3 providers, selected by configuration.
 

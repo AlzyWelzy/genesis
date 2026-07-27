@@ -85,23 +85,20 @@ async def check_rate_limit(
     """
     key = build_key("ratelimit", identity)
     now = time.time()
-    window_start = now - window_seconds
+    # The member must be unique: two requests in the same millisecond would
+    # otherwise collide into one sorted-set entry and be undercounted.
+    member = f"{now}:{generate_token(8)}"
 
     try:
-        client = get_redis()
-        async with client.pipeline(transaction=True) as pipe:
-            # Drop entries that have aged out of the window.
-            pipe.zremrangebyscore(key, 0, window_start)
-            # Count what remains — this is the usage *before* this request.
-            pipe.zcard(key)
-            # Record this request. The member must be unique: two requests in
-            # the same millisecond would otherwise collide into one sorted-set
-            # entry and be undercounted.
-            pipe.zadd(key, {f"{now}:{generate_token(8)}": now})
-            # Let an idle key disappear rather than leaking one per caller
-            # forever. Padded by a second so it cannot expire mid-window.
-            pipe.expire(key, window_seconds + 1)
-            _, used, _, _ = await pipe.execute()
+        allowed_flag, used, reset_after = await get_redis().eval(
+            _WINDOW_LUA,
+            1,
+            key,
+            str(limit),
+            str(window_seconds),
+            str(now),
+            member,
+        )
     except Exception:  # noqa: BLE001 - policy decides what an outage means
         if settings.rate_limit.fail_open:
             return fail_open(identity, limit)
@@ -112,16 +109,64 @@ async def check_rate_limit(
             allowed=False, limit=limit, remaining=0, reset_after=window_seconds
         )
 
-    # `used` excludes the request just recorded, so allow when it is below the
-    # limit — the Nth request is permitted, the N+1th is not.
-    allowed = used < limit
-    remaining = max(0, limit - used - 1)
     return RateLimitResult(
-        allowed=allowed,
+        allowed=bool(allowed_flag),
         limit=limit,
-        remaining=remaining,
-        reset_after=window_seconds,
+        remaining=max(0, limit - int(used)),
+        reset_after=int(reset_after),
     )
+
+
+#: Atomic sliding-window check, as Lua for two reasons.
+#:
+#: **Atomicity.** A pipeline groups round trips but the decision still happens
+#: in Python, between the count coming back and the entry going in. Two
+#: concurrent requests at the limit boundary both read the same count and both
+#: proceed. Doing the comparison inside Redis closes that.
+#:
+#: **Not consuming allowance on rejection.** A rejected request must not be
+#: recorded. Recording it means a client that retries while blocked keeps
+#: pushing its own window forward and never recovers — it stays locked out until
+#: it stops entirely for a full window, which a polling client never does. The
+#: token bucket below already behaves this way; this brings the two into line.
+#:
+#: Returns ``{allowed, used, reset_after}``, where ``used`` counts this request
+#: when it was permitted, and ``reset_after`` is measured from the oldest entry
+#: still in the window rather than assumed to be a whole window.
+_WINDOW_LUA = """
+local key = KEYS[1]
+local limit = tonumber(ARGV[1])
+local window = tonumber(ARGV[2])
+local now = tonumber(ARGV[3])
+local member = ARGV[4]
+
+-- Drop entries that have aged out of the trailing window.
+redis.call('ZREMRANGEBYSCORE', key, 0, now - window)
+
+local used = redis.call('ZCARD', key)
+local allowed = 0
+
+if used < limit then
+  redis.call('ZADD', key, now, member)
+  used = used + 1
+  allowed = 1
+end
+
+-- Let an idle key disappear rather than leaking one per caller forever.
+-- Padded by a second so it cannot expire mid-window.
+redis.call('EXPIRE', key, math.ceil(window) + 1)
+
+-- When the oldest entry ages out, one unit of allowance returns. That is what
+-- a rejected caller actually needs in Retry-After; a flat window length tells
+-- a client to wait far longer than it has to.
+local reset = window
+local oldest = redis.call('ZRANGE', key, 0, 0, 'WITHSCORES')
+if oldest[2] then
+  reset = math.max(1, math.ceil(tonumber(oldest[2]) + window - now))
+end
+
+return {allowed, used, reset}
+"""
 
 
 def resolve_limit(*, authenticated: bool) -> int:

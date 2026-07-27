@@ -19,7 +19,7 @@ anything that must not be lost — use the queue, or Redis Streams.
 """
 
 import json
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator, AsyncIterator
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -93,7 +93,7 @@ class RedisPubSub:
                 "Publish failed", extra={"channel": channel, "message_name": name}
             )
 
-    async def subscribe(self, *channels: str) -> AsyncIterator[Message]:
+    async def subscribe(self, *channels: str) -> AsyncGenerator[Message]:
         """Subscribe and yield decoded messages until the caller stops.
 
         Opens a **dedicated connection**. A connection in subscribe mode cannot
@@ -205,7 +205,7 @@ class RedisStreamsPubSub:
 
     async def subscribe(
         self, *channels: str, last_id: str = "$"
-    ) -> AsyncIterator[tuple[str, Message]]:
+    ) -> AsyncGenerator[tuple[str, Message]]:
         """Read messages from one or more streams, yielding the entry ID too.
 
         Args:

@@ -268,6 +268,20 @@ class SecuritySettings(BaseModel):
     #: ciphertext and the searchable fingerprints.
     blind_index_key: SecretStr | None = None
 
+    #: HMAC key for signing capability URLs — presigned download links, and
+    #: anything else where possession of the URL *is* the authorisation.
+    #:
+    #: When unset, one is derived from the JWT private key, which is always
+    #: present and genuinely secret. That keeps local development working
+    #: without configuration while ensuring the signing input is never a
+    #: publicly known value: a namespace or service name would let anyone
+    #: mint a link for any object with any expiry.
+    #:
+    #: Set it explicitly where links must outlive a signing-key rotation —
+    #: deriving means rotation invalidates every outstanding URL. For links
+    #: measured in minutes that is a feature, not a problem.
+    url_signing_key: SecretStr | None = None
+
     #: Failed attempts before an account is temporarily locked.
     max_failed_login_attempts: int = 10
 

@@ -14,6 +14,7 @@ branch to :func:`get_storage_provider`.
 """
 
 import asyncio
+import hashlib
 import hmac
 import shutil
 from collections.abc import AsyncIterator
@@ -38,6 +39,74 @@ logger = get_logger(__name__)
 
 #: Used when a stored object has no recorded content type.
 _DEFAULT_CONTENT_TYPE = "application/octet-stream"
+
+
+#: Domain separator, so a signature minted for a storage URL can never be
+#: replayed as one for some future capability URL derived from the same key.
+_URL_SIGNING_CONTEXT = b"genesis/storage/presigned-url/v1"
+
+
+def url_signing_secret() -> str:
+    """Return the HMAC key used to sign and verify capability URLs.
+
+    Why this is not simply a config string
+    --------------------------------------
+    A presigned URL *is* the authorisation: whoever holds it can read the
+    object, with no further check. The signature is the only thing standing
+    between that and "anyone can read any object", so the key behind it has to
+    be secret. Signing with a service name, a namespace or any other publicly
+    known value means an attacker can mint a link for an arbitrary key with an
+    arbitrary expiry — which is not a weak signature, it is no signature.
+
+    Prefers ``SECURITY__URL_SIGNING_KEY`` when configured. Otherwise derives one
+    from the JWT private key, which is always present (the service cannot start
+    without it) and genuinely secret, so local development needs no extra
+    configuration to be correct.
+
+    Derived through HMAC with a domain separator rather than used directly: the
+    signing key must not appear in a value that is compared against attacker-
+    supplied input, and the separator keeps this use distinct from any other
+    key derived the same way.
+
+    Deliberately not cached. ``get_signing_key()`` already is, so this costs one
+    HMAC over a string that is in memory. Caching it here would instead mean
+    holding a value derived from a key that ``reset_key_cache()`` can replace —
+    and this module cannot be invalidated from ``app.core``, which is not
+    permitted to import infrastructure.
+    """
+    configured = settings.security.url_signing_key
+    if configured is not None:
+        return configured.get_secret_value()
+
+    from app.core.security.keys import get_signing_key  # noqa: PLC0415 - cycle
+
+    return hmac.new(
+        get_signing_key().private_pem.encode(),
+        _URL_SIGNING_CONTEXT,
+        hashlib.sha256,
+    ).hexdigest()
+
+
+#: Error codes S3 uses for "this object is not here". ``head_object`` reports
+#: ``404``/``NotFound`` where ``get_object`` reports ``NoSuchKey``, so both are
+#: recognised.
+_NOT_FOUND_CODES = frozenset({"404", "NoSuchKey", "NotFound"})
+
+
+def _is_not_found(exc: BaseException) -> bool:
+    """Whether a botocore error means "absent" rather than "unavailable".
+
+    botocore builds its exception classes dynamically per service, so there is
+    no importable ``NoSuchKey`` to catch. The error code inside ``response`` is
+    the stable contract, and reading it is what lets absence be distinguished
+    from an outage — a distinction the caller very much needs.
+    """
+    response = getattr(exc, "response", None)
+    if not isinstance(response, dict):
+        return False
+    code = response.get("Error", {}).get("Code")
+    status = response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+    return str(code) in _NOT_FOUND_CODES or status == 404  # noqa: PLR2004
 
 
 def _open_read(path: Path) -> IO[bytes]:
@@ -153,17 +222,21 @@ class LocalStorageProvider:
         """
         ttl = expires_in or settings.storage.presigned_url_expire_seconds
         expires_at = int((utc_now() + timedelta(seconds=ttl)).timestamp())
-        signature = sign_payload(
-            f"{key}:{expires_at}".encode(), settings.redis.key_prefix
-        )
+        signature = sign_payload(f"{key}:{expires_at}".encode(), url_signing_secret())
         return f"/_storage/{key}?expires={expires_at}&signature={signature}"
 
     @staticmethod
     def verify_presigned(key: str, expires: int, signature: str) -> bool:
-        """Verify a signature produced by :meth:`presigned_url`."""
+        """Verify a signature produced by :meth:`presigned_url`.
+
+        Expiry is checked before the signature so an expired link is rejected
+        even if it was validly signed. The comparison itself is constant time:
+        a byte-by-byte early return leaks how much of a forged signature was
+        correct, which is enough to construct one a byte at a time.
+        """
         if expires < int(utc_now().timestamp()):
             return False
-        expected = sign_payload(f"{key}:{expires}".encode(), settings.redis.key_prefix)
+        expected = sign_payload(f"{key}:{expires}".encode(), url_signing_secret())
         return hmac.compare_digest(expected, signature)
 
     async def copy(self, source_key: str, destination_key: str) -> StoredObject:
@@ -301,13 +374,27 @@ class S3StorageProvider:
             raise ExternalServiceError("Object storage delete failed") from exc
 
     async def exists(self, key: str) -> bool:
-        """HEAD the object, interpreting a 404 as absence."""
-        async with self._client() as client:
-            try:
+        """HEAD the object, interpreting a 404 as absence.
+
+        Only a 404 (or S3's ``NoSuchKey``/``NotFound`` codes) counts as absence.
+        Anything else is re-raised as an
+        :class:`~app.core.exceptions.ExternalServiceError`.
+
+        Treating every failure as "not there" is worse than it sounds: an
+        outage, a credentials expiry or a bucket-policy change makes every
+        object report absent. A "create if it does not exist" flow then silently
+        overwrites live data, and a read path returns 404 — telling the caller
+        the object is gone — when the truthful answer is that storage is down
+        and retrying would work.
+        """
+        try:
+            async with self._client() as client:
                 await client.head_object(Bucket=self._bucket, Key=key)
-            except Exception:  # noqa: BLE001 - botocore raises a dynamic 404 type
+        except Exception as exc:
+            if _is_not_found(exc):
                 return False
-            return True
+            raise ExternalServiceError("Object storage lookup failed") from exc
+        return True
 
     async def presigned_url(self, key: str, *, expires_in: int | None = None) -> str:
         """Generate a signed GET URL.

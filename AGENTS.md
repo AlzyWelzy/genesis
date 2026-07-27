@@ -302,6 +302,40 @@ Before "fixing" any of these, read the comment next to them:
   `uvx pip-audit` directly.** `uvx` gives pip-audit its own isolated
   environment, so a bare invocation audits pip-audit's dependencies and passes
   unconditionally.
+- **`UUIDPrimaryKeyMixin` has *both* `default=uuid7` and an `init` listener.**
+  They are not redundant. `default=` is an *insert* default, evaluated at flush,
+  so without the listener `Invoice().id` is `None` until then — and an event
+  staged in the same block carries `None` silently. The listener covers
+  construction; `default=` covers paths that bypass `__init__`, such as a bulk
+  `insert()`.
+- **`migrations/env.py` filters out reflected tables it does not recognise.**
+  Without `include_object`, autogenerate writes `op.drop_table()` for anything
+  present in the database but absent from the metadata — another service's
+  table, an extension's, a colleague's work in progress.
+- **The sliding-window limiter does not record rejected requests.** Recording
+  them means a client that retries while blocked keeps pushing its own window
+  forward and never recovers. The token bucket already behaved this way; the two
+  now agree.
+- **`init_redis()` assigns the module globals only *after* the ping.** Assigning
+  first leaves a broken client cached, so the next call takes the "already
+  initialised" early return and reports success against a Redis that is down.
+- **`tests/integration/test_repository.py` declares models on the real `Base`.**
+  Deliberate — they inherit the real naming convention and type mapping. The
+  `_test_` prefix is what keeps them out of autogenerate.
+- **Presigned URLs are signed with a *derived* secret, not a config string.** A
+  presigned URL is the authorisation; signing it with a namespace or service
+  name is not a weak signature, it is no signature. `SECURITY__URL_SIGNING_KEY`
+  when set, otherwise derived from the JWT private key via HMAC with a domain
+  separator. Deliberately uncached — `app.core` may not import infrastructure,
+  so `reset_key_cache()` cannot invalidate a cached copy.
+- **`S3StorageProvider.exists()` re-raises anything that is not a 404.**
+  Treating every failure as absence means an outage makes every object report
+  missing: "create if absent" silently overwrites live data, and reads return
+  404 when the truth is "storage is down, retry".
+- **A failed email send releases its idempotency claim.** The claim is taken
+  before the transport runs, so holding it through a failure suppresses the
+  queue retry the guard exists to enable — turning "the user gets a duplicate"
+  into "the password reset never arrives".
 
 ---
 

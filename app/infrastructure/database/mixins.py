@@ -26,7 +26,7 @@ from datetime import datetime
 from typing import Any, ClassVar
 from uuid import UUID, uuid7
 
-from sqlalchemy import DateTime, ForeignKey, Index, Integer, func
+from sqlalchemy import DateTime, ForeignKey, Index, Integer, event, func
 from sqlalchemy.orm import Mapped, declared_attr, mapped_column
 
 
@@ -48,9 +48,38 @@ class UUIDPrimaryKeyMixin:
     database, so the application knows the ID before the ``INSERT`` — which is
     what lets it build related rows and publish events in one pass without a
     round trip.
+
+    That last property is why the ID is assigned at **construction** and not
+    only at flush. A bare ``default=uuid7`` is an *insert* default: SQLAlchemy
+    evaluates it while flushing, so ``Invoice().id`` is ``None`` until then, and
+    code doing exactly what this docstring advertises::
+
+        invoice = Invoice(...)
+        await stage(session, InvoicePaid(invoice_id=invoice.id))
+        await repo.add(invoice)
+
+    stages an event carrying ``None`` — silently, because the column is
+    perfectly happy to be populated a moment later. The listener below closes
+    that window. ``default=uuid7`` stays as the backstop for rows created by
+    paths that bypass ``__init__``, such as a bulk ``insert()``.
     """
 
     id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid7)
+
+
+@event.listens_for(UUIDPrimaryKeyMixin, "init", propagate=True)
+def _assign_primary_key_on_init(
+    _target: object, _args: tuple[Any, ...], kwargs: dict[str, Any]
+) -> None:
+    """Populate ``id`` when the instance is constructed, not when it is flushed.
+
+    ``propagate=True`` is what makes a single listener on the unmapped mixin
+    apply to every model inheriting it, including ones declared later.
+
+    ``setdefault`` rather than assignment: an explicitly supplied ID — restoring
+    a record, importing across environments, a test pinning a value — must win.
+    """
+    kwargs.setdefault("id", uuid7())
 
 
 class TimestampMixin:

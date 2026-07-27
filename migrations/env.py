@@ -66,6 +66,32 @@ if not config.get_main_option("sqlalchemy.url", None):
 target_metadata = Base.metadata
 
 
+#: Tables with this prefix are declared by the test suite on ``Base.metadata``
+#: and created inside a transaction that is rolled back. They use the real
+#: declarative base deliberately, so they inherit the real naming convention and
+#: type mapping — which also means autogenerate would otherwise try to create
+#: them.
+TEST_TABLE_PREFIX = "_test_"
+
+
+def _include_object(_obj, name, type_, reflected, compare_to) -> bool:
+    """Decide whether autogenerate should consider a schema object.
+
+    Two distinct jobs:
+
+    * Skip the throwaway tables the test suite puts on ``Base.metadata``.
+    * Skip *reflected* tables the application does not own. Without this,
+      autogenerate treats anything present in the database but absent from the
+      metadata as something to remove, and writes ``op.drop_table()`` for a
+      table belonging to another service, an extension, or a colleague's work in
+      progress. Generated migrations are reviewed by a human, but that is a thin
+      defence against a diff that otherwise looks entirely routine.
+    """
+    if type_ == "table" and name is not None and name.startswith(TEST_TABLE_PREFIX):
+        return False
+    return not (type_ == "table" and reflected and compare_to is None)
+
+
 def _configure(connection: Connection) -> None:
     """Configure the migration context for a live connection.
 
@@ -79,6 +105,7 @@ def _configure(connection: Connection) -> None:
         compare_type=True,
         compare_server_default=True,
         include_schemas=False,
+        include_object=_include_object,
     )
 
 
@@ -88,11 +115,18 @@ def run_migrations_offline() -> None:
     For environments where a DBA applies migrations by hand and the application
     has no DDL privileges.
     """
+    # Reads the *resolved* option rather than `settings.database.url`. The block
+    # above already reconciled "a caller supplied a URL" with "fall back to
+    # settings"; going back to settings here ignores an explicitly targeted
+    # database and emits DDL for whatever the environment happens to point at.
+    # That is the same bug the online path had — in the one mode whose output is
+    # handed to a DBA to run against production.
     context.configure(
-        url=str(settings.database.url),
+        url=config.get_main_option("sqlalchemy.url"),
         target_metadata=target_metadata,
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
+        include_object=_include_object,
     )
     with context.begin_transaction():
         context.run_migrations()

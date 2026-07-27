@@ -12,6 +12,7 @@ import asyncio
 
 import pytest
 
+from app.infrastructure.email.client import EmailMessage
 from app.infrastructure.queue.client import (
     DEAD_LETTER_KEY,
     DELAYED_KEY,
@@ -46,6 +47,113 @@ async def redis_client():
     async for key in client.scan_iter(match=build_key("test") + "*"):
         await client.delete(key)
     await close_redis()
+
+
+class TestConnectionLifecycle:
+    """The startup path, which decides whether the process is allowed to serve."""
+
+    async def test_a_failed_connection_leaves_nothing_cached(self) -> None:
+        """A failed init must not poison the process-wide client.
+
+        Assigning the client before pinging looks equivalent to assigning after
+        and is not: the failed client stays cached, so the *next* ``init_redis``
+        takes the "already initialised" early return and reports success without
+        ever pinging. Startup then proceeds against a Redis that is not there,
+        and the failure resurfaces later, at the point of use, with nothing
+        connecting it back to the cause.
+        """
+        from app.core.config import settings
+        from app.infrastructure.redis import client as redis_client_module
+
+        await close_redis()
+        original = settings.redis.url
+        # A port nothing listens on, so connecting fails fast.
+        object.__setattr__(settings.redis, "url", "redis://127.0.0.1:1/0")
+        try:
+            with pytest.raises(Exception, match=r".*"):
+                await init_redis()
+
+            assert redis_client_module._client is None
+            with pytest.raises(RuntimeError, match="not initialised"):
+                redis_client_module.get_redis()
+            assert await redis_client_module.check_redis_health() is False
+
+            # And the second attempt must genuinely retry, not report success.
+            with pytest.raises(Exception, match=r".*"):
+                await init_redis()
+        finally:
+            object.__setattr__(settings.redis, "url", original)
+            await close_redis()
+
+
+class TestEmailIdempotencyClaim:
+    """The guard must not become the reason a message is never delivered.
+
+    The claim is taken *before* the transport runs, so a send that then fails
+    would leave the key in place for the whole idempotency window — suppressing
+    the queue retry that is the entire reason the guard exists. A transient SMTP
+    error stops being "the user gets a duplicate" and becomes "the password
+    reset never arrives", silently, for hours.
+    """
+
+    @pytest.fixture(autouse=True)
+    async def _clear_claims(self, redis_client):
+        """Drop any claim left by a previous run.
+
+        The claims carry a 24-hour TTL and live outside the ``test:`` prefix the
+        session fixture sweeps, so without this the first assertion in each test
+        depends on whether the suite ran earlier today.
+        """
+        async for key in redis_client.scan_iter(match=build_key("email:sent") + "*"):
+            await redis_client.delete(key)
+
+    @staticmethod
+    def _message(subject: str) -> EmailMessage:
+        return EmailMessage(
+            to=["someone@example.com"], subject=subject, template="welcome"
+        )
+
+    async def test_a_claim_suppresses_a_duplicate(self, redis_client) -> None:
+        from app.infrastructure.email.providers import claim_send
+
+        message = self._message("test claim dedupe")
+        assert await claim_send(message) is True
+        assert await claim_send(message) is False
+
+    async def test_releasing_a_claim_allows_the_retry(self, redis_client) -> None:
+        from app.infrastructure.email.providers import claim_send, release_send_claim
+
+        message = self._message("test claim release")
+        assert await claim_send(message) is True
+
+        await release_send_claim(message)
+        assert await claim_send(message) is True
+
+    async def test_a_failed_send_releases_its_claim(self, redis_client) -> None:
+        """End to end through the provider, with the transport failing."""
+        from app.infrastructure.email.providers import SMTPEmailProvider, claim_send
+
+        message = self._message("test failed send")
+
+        class FailingClient:
+            async def connect(self) -> None: ...
+            async def quit(self) -> None: ...
+
+            async def send_message(self, *_args: object, **_kwargs: object) -> None:
+                raise OSError("connection reset")
+
+        provider = SMTPEmailProvider.__new__(SMTPEmailProvider)
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(
+                "app.infrastructure.email.providers.aiosmtplib.SMTP",
+                lambda **_kwargs: FailingClient(),
+            )
+            with pytest.raises(Exception, match="Email delivery failed"):
+                await provider.send_batch([message])
+
+        # The retry must be able to claim it again. Without the release this
+        # returns False and the message is lost for the idempotency window.
+        assert await claim_send(message) is True
 
 
 class TestRedisCache:
@@ -140,6 +248,79 @@ class TestRateLimit:
         headers = result.headers()
         assert headers["X-RateLimit-Limit"] == "10"
         assert headers["X-RateLimit-Remaining"] == "9"
+
+    async def test_a_rejected_request_does_not_consume_allowance(
+        self, redis_client
+    ) -> None:
+        """Otherwise a client that retries while blocked never recovers.
+
+        Recording the rejected attempt pushes the caller's own window forward on
+        every retry, so it stays locked out until it stops entirely for a full
+        window — which a polling client never does. The lockout is permanent and
+        looks, from the outside, like the limiter is simply broken.
+
+        Verified through the sorted set rather than through a later decision,
+        because the window here is 60 seconds: the state is the evidence.
+        """
+        await reset_rate_limit("test:rl-retry")
+        for _ in range(2):
+            await check_rate_limit("test:rl-retry", limit=2, window_seconds=60)
+
+        for _ in range(5):
+            rejected = await check_rate_limit(
+                "test:rl-retry", limit=2, window_seconds=60
+            )
+            assert rejected.allowed is False
+
+        assert await redis_client.zcard(build_key("ratelimit", "test:rl-retry")) == 2
+
+    async def test_a_short_window_frees_up_despite_continuous_retries(
+        self, redis_client
+    ) -> None:
+        """The end-to-end consequence: a hammering client is served again."""
+        await reset_rate_limit("test:rl-recover")
+        assert (
+            await check_rate_limit("test:rl-recover", limit=1, window_seconds=1)
+        ).allowed
+
+        # Retry throughout and past the window, as a real client would. One of
+        # these must succeed; under the old behaviour every retry re-armed the
+        # window and none ever would.
+        served = []
+        for _ in range(8):
+            await asyncio.sleep(0.2)
+            result = await check_rate_limit(
+                "test:rl-recover", limit=1, window_seconds=1
+            )
+            served.append(result.allowed)
+
+        assert any(served)
+
+    async def test_reset_reflects_the_oldest_entry_not_a_whole_window(
+        self, redis_client
+    ) -> None:
+        """``Retry-After`` must say when allowance returns, not the window length.
+
+        A flat window length tells a client to wait far longer than it needs to,
+        which for an interactive caller reads as a much harsher limit than the
+        one configured.
+        """
+        await reset_rate_limit("test:rl-reset")
+        await check_rate_limit("test:rl-reset", limit=1, window_seconds=10)
+        await asyncio.sleep(1.1)
+
+        rejected = await check_rate_limit("test:rl-reset", limit=1, window_seconds=10)
+        assert rejected.allowed is False
+        assert rejected.reset_after < 10
+
+    async def test_reset_is_never_zero_while_blocked(self, redis_client) -> None:
+        """A ``Retry-After: 0`` invites an immediate retry that is also rejected."""
+        await reset_rate_limit("test:rl-reset0")
+        await check_rate_limit("test:rl-reset0", limit=1, window_seconds=1)
+
+        rejected = await check_rate_limit("test:rl-reset0", limit=1, window_seconds=1)
+        assert rejected.allowed is False
+        assert rejected.reset_after >= 1
 
 
 class TestQueue:

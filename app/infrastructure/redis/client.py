@@ -47,25 +47,40 @@ async def init_redis() -> Redis:
     Returns:
         The connected client.
     """
-    global _pool, _client  # noqa: PLW0603 - process-wide singleton by design
+    # Process-wide singleton by design; see the module docstring.
+    global _pool, _client
 
     if _client is not None:
         return _client
 
-    _pool = ConnectionPool.from_url(
+    pool = ConnectionPool.from_url(
         str(settings.redis.url),
         max_connections=settings.redis.max_connections,
         socket_timeout=settings.redis.socket_timeout_seconds,
         socket_connect_timeout=settings.redis.socket_timeout_seconds,
         decode_responses=False,
     )
-    _client = Redis(connection_pool=_pool)
-    await _client.ping()
+    client = Redis(connection_pool=pool)
+
+    # Published to the module globals only after the ping succeeds. Assigning
+    # first and pinging second looks equivalent and is not: a failed ping leaves
+    # a broken client cached, so the *next* call takes the early return above
+    # and reports success without ever pinging. Startup then proceeds against a
+    # Redis that is not there, and the failure resurfaces later, at the point of
+    # use, with nothing connecting it to the cause.
+    try:
+        await client.ping()
+    except BaseException:
+        await client.aclose()
+        await pool.aclose()
+        raise
+
+    _pool, _client = pool, client
     logger.info(
         "Redis connected",
         extra={"max_connections": settings.redis.max_connections},
     )
-    return _client
+    return client
 
 
 def get_redis() -> Redis:

@@ -271,6 +271,34 @@ with it on; do not weaken that.
 
 ---
 
+## 9b. Property tests
+
+`tests/property/` states invariants over *generated* input rather than chosen
+examples. It exists because example tests have a structural blind spot: the
+author picks the input, and an author who had thought of the failing input would
+have fixed the bug instead of writing a passing test. Four shipped bugs were
+invisible to the example suite for exactly that reason — a cursor rejected for 7%
+of inputs, a `deep_merge` that aliased its own inputs, a payload that could not
+serialise a `date`, a duration that lost microseconds past a few hundred years.
+
+```bash
+uv run pytest tests/property                          # 50 examples, fast
+HYPOTHESIS_PROFILE=ci uv run pytest tests/property    # 500 — what CI runs
+HYPOTHESIS_PROFILE=thorough uv run pytest tests/property   # 5000 — a hunt
+```
+
+**Add a property whenever you add a pure function** that encodes, parses,
+truncates, escapes, merges or signs. State a relationship that must hold for
+every input — a round-trip, a bound, idempotence, independence — not a
+restatement of the implementation.
+
+When a property fails, read the shrunk counterexample before changing anything.
+A failure is a disagreement between the code and a claim about it, and the claim
+is sometimes the wrong one: several properties here were rewritten because the
+first version asserted something the function never promised.
+
+---
+
 ## 10. Things that look wrong but are not
 
 Before "fixing" any of these, read the comment next to them:

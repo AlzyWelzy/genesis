@@ -89,6 +89,13 @@ jobs:
       - run: uv sync --frozen --all-extras
 
       - name: Run tests
+        # The property suite runs under the `ci` profile: 500 generated examples
+        # per invariant rather than the 50 a developer gets locally. Several
+        # bugs this repository shipped were input-dependent — a pagination
+        # cursor that failed for 7% of inputs, a duration that lost precision
+        # only past a few hundred years — and none is reliably caught at 50.
+        env:
+          HYPOTHESIS_PROFILE: ci
         run: uv run pytest --cov=app --cov-report=term-missing --cov-report=xml
 
       - uses: actions/upload-artifact@v4

@@ -103,3 +103,51 @@ tells you nothing.
 Look at what is uncovered rather than at the percentage. Uncovered error paths
 are the ones worth writing tests for — they are the paths that run during an
 incident.
+
+
+## Property-based tests
+
+`tests/property/` is a separate layer from the example tests, not a duplicate of
+them. The distinction is who chooses the input.
+
+An example test asserts behaviour for an input the author picked. That is
+exactly where its blind spot is: an author who had thought of the failing input
+would have fixed the bug rather than written a test that passes. Four bugs in
+this repository shipped through a green example suite for that reason:
+
+| Bug | Why every example passed |
+|---|---|
+| Cursor rejected ~7% of the time | The signature's raw bytes only sometimes contained the delimiter |
+| `deep_merge` aliased its inputs | The test asserted "does not mutate inputs", which was true |
+| `to_payload` could not encode a `date` | No test carried one |
+| `timedelta` lost microseconds | Only past ~272 years of duration |
+
+A property test states an invariant that must hold for **every** input, and
+Hypothesis searches for a counterexample — reaching lone surrogates, empty
+strings, hundred-thousand-day durations and values differing only by Unicode
+normalisation form. On failure it shrinks to the smallest input that still
+breaks, which usually makes the cause obvious.
+
+### Profiles
+
+| Profile | Examples | Used for |
+|---|---|---|
+| `dev` (default) | 50 | Local runs; keeps the suite fast enough to run always |
+| `ci` | 500 | What CI enforces |
+| `thorough` | 5000 | Pre-release, or when a bug suggests a class of input was never explored |
+
+Select with `HYPOTHESIS_PROFILE=ci` or `--hypothesis-profile=thorough`.
+
+### When to write one
+
+Whenever you add a pure function that encodes, parses, truncates, escapes,
+merges or signs. Good properties are relationships, not restatements:
+
+* **Round-trip** — `decode(encode(x)) == x` for every `x`, and `decode` rejects
+  everything `encode` did not produce.
+* **Bounds** — `len(truncate(s, n)) <= n`.
+* **Idempotence** — `slugify(slugify(x)) == slugify(x)`.
+* **Independence** — the result shares no mutable structure with its inputs.
+
+Keep I/O out. Hypothesis calls a test hundreds of times; anything touching
+PostgreSQL or Redis belongs in `tests/integration/`.

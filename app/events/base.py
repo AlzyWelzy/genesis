@@ -125,7 +125,7 @@ class DomainEvent:
 _SCALAR_ENCODERS: tuple[tuple[type | UnionType, Callable[[Any], Any]], ...] = (
     (datetime, lambda value: value.isoformat()),
     (date, lambda value: value.isoformat()),
-    (timedelta, lambda value: value.total_seconds()),
+    (timedelta, lambda value: str(_exact_seconds(value))),
     (UUID, str),
     (Decimal, str),
     (Enum, lambda value: value.value),
@@ -134,6 +134,27 @@ _SCALAR_ENCODERS: tuple[tuple[type | UnionType, Callable[[Any], Any]], ...] = (
     # is not valid UTF-8.
     (bytes | bytearray, lambda value: base64.b64encode(value).decode("ascii")),
 )
+
+
+def _exact_seconds(value: timedelta) -> Decimal:
+    """Return a duration's total seconds without floating-point loss.
+
+    ``timedelta.total_seconds()`` returns a ``float``, and a float carries about
+    15 to 17 significant digits. A few hundred years of duration already needs
+    more than that to keep microseconds, so ``timedelta(days=99421,
+    microseconds=1)`` comes back as ``...400.000002`` — off by a microsecond,
+    silently.
+
+    That is the same trap as encoding money as a float, which this module
+    already refuses for ``Decimal``. Rendered as a decimal string for the same
+    reason: it is exact, and a consumer in another language reads it the way it
+    already reads a monetary amount.
+    """
+    return (
+        Decimal(value.days) * 86_400
+        + Decimal(value.seconds)
+        + Decimal(value.microseconds) / 1_000_000
+    )
 
 
 def _to_jsonable(value: Any) -> Any:

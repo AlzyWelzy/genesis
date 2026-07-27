@@ -269,7 +269,7 @@ class TestPayloadSerialisation:
         ("label", "value", "expected"),
         [
             ("date", date(2026, 1, 2), "2026-01-02"),
-            ("timedelta", timedelta(seconds=90), 90.0),
+            ("timedelta", timedelta(seconds=90), "90"),
             ("bytes", b"\xff\xfe", "//4="),
             ("decimal", Decimal("1.005"), "1.005"),
         ],

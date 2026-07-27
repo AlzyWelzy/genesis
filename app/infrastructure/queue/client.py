@@ -40,9 +40,10 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import timedelta
 from typing import Any, Protocol
-from uuid import uuid7
+from uuid import UUID, uuid7
 
 from app.common.utils.datetime import utc_now
+from app.core.context import current_context
 from app.core.logging import get_logger
 from app.infrastructure.redis.client import build_key, get_redis
 
@@ -98,8 +99,23 @@ class Job:
         """Serialise for a Redis stream entry.
 
         Stream fields are flat strings, so the payload is nested as JSON.
+
+        The ambient request context is captured here, at enqueue time, because
+        this is the last moment it exists — the worker runs in a different
+        process with no notion of the request that caused the job. Two things
+        depend on it:
+
+        * **Correlation.** Without it, a job's log lines are orphans and no
+          support query can connect them to the user action that produced them.
+        * **Tenancy.** A handler using a ``TenantRepository`` reads the tenant
+          from the ambient context, so a job enqueued without one cannot do
+          tenant-scoped work at all — ``require_tenant_id()`` raises.
+
+        Omitted rather than written as ``"None"`` when absent, so a decoder
+        cannot mistake the string for a value.
         """
-        return {
+        context = current_context()
+        fields = {
             "id": job_id,
             "name": self.name,
             "payload": json.dumps(self.payload),
@@ -107,6 +123,13 @@ class Job:
             "max_retries": str(self.max_retries),
             "enqueued_at": utc_now().isoformat(),
         }
+        if context.correlation_id is not None:
+            fields["correlation_id"] = context.correlation_id
+        if context.tenant_id is not None:
+            fields["tenant_id"] = str(context.tenant_id)
+        if context.user_id is not None:
+            fields["user_id"] = str(context.user_id)
+        return fields
 
 
 @dataclass(frozen=True, slots=True)
@@ -119,6 +142,14 @@ class DeliveredJob:
     payload: dict[str, Any]
     attempt: int
     max_retries: int
+
+    #: Context captured by :meth:`Job.encode` in the process that enqueued the
+    #: job. ``tenant_id`` is load-bearing rather than decorative: a handler
+    #: using a ``TenantRepository`` reads the tenant from the ambient context,
+    #: so a job dispatched without it cannot do tenant-scoped work at all.
+    correlation_id: str | None = None
+    tenant_id: UUID | None = None
+    user_id: UUID | None = None
 
     @property
     def can_retry(self) -> bool:
@@ -322,6 +353,23 @@ def set_queue(implementation: Queue) -> None:
     """Replace the process-wide queue."""
     global queue  # noqa: PLW0603 - process-wide singleton by design
     queue = implementation
+
+
+def get_queue() -> Queue:
+    """Return the current process-wide queue.
+
+    Always reach the queue through this, never ``from ... import queue``. A
+    ``from``-import binds the object into the importing module's namespace at
+    import time, so a later :func:`set_queue` rebinds this module's name and
+    leaves every such importer still holding the old one. In tests that means
+    the in-memory fake is installed and the real Redis queue is used anyway —
+    which fails as a connection error at best, and silently enqueues into a
+    developer's live Redis at worst.
+
+    Matches ``get_redis``, ``get_storage``, ``get_email_provider`` and
+    ``get_metrics``, which exist for the same reason.
+    """
+    return queue
 
 
 # For a job that must never be lost when the enqueue succeeds but the

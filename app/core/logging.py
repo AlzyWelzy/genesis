@@ -74,7 +74,35 @@ class ContextFilter(logging.Filter):
         record.correlation_id = correlation_id_var.get()
         tenant_id = tenant_id_var.get()
         record.tenant_id = str(tenant_id) if tenant_id else None
+        record.trace_id = _current_trace_id()
         return True
+
+
+def _current_trace_id() -> str | None:
+    """Return the active trace ID, or ``None`` when tracing is not running.
+
+    This is the half of trace/log correlation that lives on the log side.
+    Without it a trace viewer can show that a request was slow but not why: the
+    jump from a slow span to that request's log lines is exactly the step an
+    investigation needs, and it only works if the ID is on both.
+
+    Imported lazily for two reasons. ``app.infrastructure.observability.tracing``
+    imports :func:`get_logger` from this module, so a top-level import closes a
+    cycle. And tracing is an optional extra — resolving it at import time would
+    make a deployment without it pay for a module it will never use.
+
+    Never raises. A logging filter that can fail takes down logging itself,
+    which is the last thing that should break while something else is going
+    wrong.
+    """
+    try:
+        from app.infrastructure.observability.tracing import (  # noqa: PLC0415 - cycle
+            current_trace_id,
+        )
+
+        return current_trace_id()
+    except Exception:  # noqa: BLE001 - logging must never be the thing that fails
+        return None
 
 
 def _redact(value: Any, key: str | None = None) -> Any:

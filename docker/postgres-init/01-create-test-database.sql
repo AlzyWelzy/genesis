@@ -1,0 +1,12 @@
+-- Creates the database the test suite uses.
+--
+-- Without this, `docker compose up` followed by `pytest` produces 45 silent
+-- skips and a green-looking summary line: the integration tests are written to
+-- skip rather than fail when PostgreSQL is unreachable, which is the right
+-- behaviour on a laptop with nothing running, and precisely the wrong signal
+-- when the stack *is* running but the database is simply absent.
+--
+-- Scripts in /docker-entrypoint-initdb.d run only when the data directory is
+-- empty — i.e. on first creation of the named volume. After changing this file,
+-- recreate it: `docker compose down -v && docker compose up -d`.
+CREATE DATABASE genesis_test;

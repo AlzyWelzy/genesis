@@ -486,6 +486,51 @@ read-modify-write cannot interleave.
 never learns. `RedisStreamsPubSub` keeps a capped log a reconnecting subscriber
 can resume from, turning "lost on disconnect" into "lost after N messages".
 
+Two database exceptions are translated at the edge rather than falling through
+to the catch-all handler. `StaleDataError` — an optimistic-lock version check
+that lost its race — becomes a 409 `stale_data`, because the caller's request was
+well-formed and the correct answer is "refetch and retry"; a 500 there means two
+people editing one record produces an alert and a traceback. A unique-violation
+`IntegrityError` becomes a 409 `already_exists`, matched on SQLSTATE `23505`
+rather than on the driver's message, which is localised and version-dependent.
+Racing a uniqueness check is not a bug to fix by checking harder: between any
+`SELECT` and its `INSERT` there is a window, and the constraint is what closes
+it. Every *other* integrity error stays a 500 — a foreign-key or check-constraint
+failure means the application let through data it should have rejected. The
+database's own message is never forwarded; it names tables, columns and
+constraints.
+
+The relay runs in `scripts/worker.py`, alongside the queue consumer. That is not
+an implementation detail to be relocated casually: a staged event that no process
+publishes is silently lost, which inverts the pattern into the failure it exists
+to prevent. Running several is safe — claiming uses `FOR UPDATE SKIP LOCKED`.
+
+The default publisher, `publish_to_queue`, enqueues the event as a job named
+`outbox.<event name>`. The queue is the right destination rather than the
+in-process event bus because the relay lives in a background process, so
+publication has to cross a process boundary anyway — and the queue already
+supplies acknowledgement, exponential backoff, a dead-letter destination and
+name-based dispatch that does not require rebuilding the original Python class
+from JSON. Outbox for "the intent survives the commit", queue for "the attempt is
+retried"; neither alone is enough. The job carries `outbox:<message id>` as its
+idempotency key, so a row republished after a crash between publishing and
+marking it published is suppressed rather than delivered twice.
+
+Ambient context crosses the process boundary as ordinary stream fields.
+`Job.encode` captures `correlation_id`, `tenant_id` and `user_id` at enqueue
+time — the last moment they exist, since the worker runs elsewhere — and
+`Worker._dispatch` rebinds them with `request_scope` around the handler, per job
+rather than per batch so concurrent jobs cannot see each other's tenant. The
+outbox relay does the same from the message's own columns.
+
+This is load-bearing rather than cosmetic. A `TenantRepository` reads the tenant
+from the ambient context, so a job dispatched without one does not merely lose
+its log correlation — it raises on `require_tenant_id()`, making tenant-scoped
+background work impossible. The retry path re-serialises the fields from the job
+rather than from ambient context, because it runs in the worker's failure path,
+outside the scope the handler ran under; reading ambient there would give
+attempt 1 a tenant and attempt 2 none.
+
 ### `infrastructure/storage/`
 
 `presigned_url` / `verify_presigned` sign with `url_signing_secret()`, which

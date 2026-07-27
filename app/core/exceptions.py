@@ -46,6 +46,8 @@ from typing import Any
 from fastapi import FastAPI, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm.exc import StaleDataError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.core.context import get_request_id
@@ -279,6 +281,27 @@ def _error_response(  # noqa: PLR0913 - internal renderer; extras are keyword-on
     )
 
 
+#: PostgreSQL's SQLSTATE for a unique-constraint violation. Matched on the code
+#: rather than on the message, which is localised and version-dependent.
+_UNIQUE_VIOLATION_SQLSTATE = "23505"
+
+
+def _is_unique_violation(exc: IntegrityError) -> bool:
+    """Whether an integrity error is specifically a duplicate-key violation.
+
+    Distinguishing matters: a unique violation is a 409 the caller can act on,
+    while a foreign-key or check-constraint failure means the application
+    admitted data it should have rejected — a bug that must stay a 500 so it is
+    noticed rather than reported to the user as a routine conflict.
+
+    Reads ``sqlstate`` off the driver's own exception. asyncpg exposes it
+    directly; SQLAlchemy re-raises with the original attached as ``orig``.
+    """
+    original = getattr(exc, "orig", None)
+    sqlstate = getattr(original, "sqlstate", None) or getattr(original, "pgcode", None)
+    return sqlstate == _UNIQUE_VIOLATION_SQLSTATE
+
+
 def register_exception_handlers(app: FastAPI) -> None:
     """Install the global handlers that normalise every error response.
 
@@ -348,6 +371,61 @@ def register_exception_handlers(app: FastAPI) -> None:
             codes.get(exc.status_code, "http_error"),
             str(exc.detail),
             headers=getattr(exc, "headers", None),
+        )
+
+    @app.exception_handler(StaleDataError)
+    async def handle_stale_data(_: Request, __: StaleDataError) -> JSONResponse:
+        """An optimistic-lock version check that lost the race.
+
+        SQLAlchemy raises this when a row carrying
+        :class:`~app.infrastructure.database.mixins.VersionMixin` changed
+        underneath an in-flight update. That is a **conflict**, not a server
+        fault: the caller's request was well-formed and the correct answer is
+        "refetch and try again", which a 409 says and a 500 does not. Without
+        this, two people editing the same record produces an alert and a
+        traceback instead of a retry.
+        """
+        logger.info("Optimistic lock conflict", extra={"code": "stale_data"})
+        return _error_response(
+            status.HTTP_409_CONFLICT,
+            "stale_data",
+            "This record changed while you were editing it. Refetch and retry.",
+        )
+
+    @app.exception_handler(IntegrityError)
+    async def handle_integrity_error(
+        request: Request, exc: IntegrityError
+    ) -> JSONResponse:
+        """A database constraint the application did not check first.
+
+        Unique violations are the common case and are genuinely a 409: two
+        concurrent registrations for one email cannot both win, and the loser's
+        request was not malformed. Racing the check is not a bug to be fixed by
+        checking harder — between any ``SELECT`` and its ``INSERT`` there is a
+        window, and the constraint is what closes it.
+
+        Anything else — a foreign key or check constraint firing — means the
+        application let through data it should have rejected, which *is* a bug
+        and stays a 500 with a traceback.
+
+        The database's own message is never forwarded. It names tables, columns
+        and constraints, and that is an internal schema description handed to
+        whoever asked.
+        """
+        if _is_unique_violation(exc):
+            logger.info("Unique constraint conflict", extra={"code": "already_exists"})
+            return _error_response(
+                status.HTTP_409_CONFLICT,
+                "already_exists",
+                "A resource with those details already exists.",
+            )
+
+        logger.exception("Database integrity error", exc_info=exc)
+        return _error_response(
+            status.HTTP_500_INTERNAL_SERVER_ERROR,
+            "internal_error",
+            "An unexpected error occurred.",
+            request_id=request_id_from(request),
         )
 
     @app.exception_handler(Exception)

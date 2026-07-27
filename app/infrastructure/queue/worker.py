@@ -27,10 +27,12 @@ Run it with ``uv run python scripts/worker.py``.
 import asyncio
 import json
 from typing import Any, cast
+from uuid import UUID
 
 from redis.exceptions import ResponseError
 
 from app.common.utils.datetime import utc_now
+from app.core.context import request_scope
 from app.core.logging import get_logger
 from app.infrastructure.queue.client import (
     CONSUMER_GROUP,
@@ -231,7 +233,22 @@ class Worker:
             return
 
         try:
-            await handler(job.payload)
+            # Rebind the context the job was enqueued under. Two things need
+            # it, and both fail silently or confusingly without it: log lines
+            # would carry no correlation ID and be unlinkable to the request
+            # that caused the work, and a handler touching a `TenantRepository`
+            # would raise on `require_tenant_id()` — making tenant-scoped
+            # background work impossible rather than merely untraceable.
+            #
+            # Bound per job, not per batch: jobs run concurrently under
+            # `asyncio.gather`, and each task gets its own ContextVar copy, so
+            # one job's tenant cannot leak into another's.
+            async with request_scope(
+                correlation_id=job.correlation_id,
+                tenant_id=job.tenant_id,
+                user_id=job.user_id,
+            ):
+                await handler(job.payload)
         except Exception as exc:  # noqa: BLE001 - handler failures are expected
             await self._handle_failure(job, exc)
         else:
@@ -280,6 +297,13 @@ class Worker:
                         "attempt": str(attempt),
                         "max_retries": str(job.max_retries),
                         "enqueued_at": utc_now().isoformat(),
+                        # Carried from the job, not from the ambient context:
+                        # this runs in the worker's failure path, outside the
+                        # scope the handler ran under. Dropping these here would
+                        # mean attempt 1 has a tenant and attempt 2 does not —
+                        # so a retried job silently loses the ability to do the
+                        # tenant-scoped work that the first attempt could.
+                        **_context_fields(job),
                     }
                 ): (utc_now().timestamp() + delay)
             },
@@ -322,4 +346,41 @@ def _to_job(message_id: Any, fields: dict[Any, Any]) -> DeliveredJob:
         payload=json.loads(decoded.get("payload", "{}")),
         attempt=int(decoded.get("attempt", 0)),
         max_retries=int(decoded.get("max_retries", 3)),
+        correlation_id=decoded.get("correlation_id"),
+        tenant_id=_optional_uuid(decoded.get("tenant_id")),
+        user_id=_optional_uuid(decoded.get("user_id")),
     )
+
+
+def _context_fields(job: DeliveredJob) -> dict[str, str]:
+    """Render a job's captured context back into flat stream fields.
+
+    Absent values are omitted rather than written as ``"None"``, matching
+    :meth:`~app.infrastructure.queue.client.Job.encode`, so a decoder cannot
+    mistake the string for a value.
+    """
+    fields: dict[str, str] = {}
+    if job.correlation_id is not None:
+        fields["correlation_id"] = job.correlation_id
+    if job.tenant_id is not None:
+        fields["tenant_id"] = str(job.tenant_id)
+    if job.user_id is not None:
+        fields["user_id"] = str(job.user_id)
+    return fields
+
+
+def _optional_uuid(value: str | None) -> UUID | None:
+    """Parse a UUID field that may be absent or unparseable.
+
+    A malformed value is dropped rather than raised on: it would fail the job
+    before the handler ever ran, and for context — which is metadata about the
+    work, not the work itself — losing correlation is a far smaller harm than
+    losing the job.
+    """
+    if not value:
+        return None
+    try:
+        return UUID(value)
+    except ValueError:
+        logger.warning("Discarding an unparseable context UUID on a job")
+        return None

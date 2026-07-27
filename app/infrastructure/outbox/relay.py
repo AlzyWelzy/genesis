@@ -44,7 +44,7 @@ from sqlalchemy.engine import Result
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.common.utils.datetime import utc_now
-from app.core.context import get_correlation_id, get_tenant_id
+from app.core.context import get_correlation_id, get_tenant_id, request_scope
 from app.core.logging import get_logger
 from app.events.base import DomainEvent
 from app.infrastructure.database.session import session_scope
@@ -116,6 +116,57 @@ async def stage_many(
 ) -> list[OutboxMessage]:
     """Stage several events in one transaction."""
     return [await stage(session, event) for event in events]
+
+
+#: Prefix for the task name a staged event is dispatched to. Namespaced so an
+#: event-driven handler can never collide with a directly enqueued job, and so
+#: `resolve` failures name the origin of the work.
+OUTBOX_TASK_PREFIX = "outbox"
+
+
+def outbox_task_name(event_name: str) -> str:
+    """Return the task name a staged event is delivered to.
+
+    A feature subscribes to a durable event by registering a task under this
+    name::
+
+        @tasks.register(outbox_task_name("billing.invoice_paid"))
+        async def on_invoice_paid(payload: dict) -> None: ...
+    """
+    return f"{OUTBOX_TASK_PREFIX}.{event_name}"
+
+
+async def publish_to_queue(message: OutboxMessage) -> None:
+    """Default publisher: hand a staged event to the job queue.
+
+    Why the queue rather than the in-process event bus
+    --------------------------------------------------
+    The relay runs in a background process, so "publish" has to mean something
+    that crosses a process boundary. The queue already provides everything the
+    delivery needs and the bus does not: acknowledgement, exponential backoff,
+    a dead-letter destination, and name-based dispatch that does not require
+    reconstructing the original Python class from JSON.
+
+    That composition — commit transactionally, then hand to the queue — is the
+    point of the outbox. The transaction guarantees the intent survives; the
+    queue guarantees the attempt is retried. Neither alone is sufficient.
+
+    Raises on failure rather than swallowing, so the relay records the attempt
+    and backs off. A publisher that failed quietly would mark the row published
+    and lose the event, which is the exact outcome the outbox exists to prevent.
+    """
+    from app.infrastructure.queue.client import Job, get_queue  # noqa: PLC0415 - cycle
+
+    await get_queue().enqueue(
+        Job(
+            name=outbox_task_name(message.name),
+            payload=message.payload,
+            # The event ID is stable across relay retries, so a message
+            # republished after a crash between publish and mark-published is
+            # suppressed rather than delivered twice.
+            idempotency_key=f"outbox:{message.id}",
+        )
+    )
 
 
 class OutboxRelay:
@@ -207,7 +258,16 @@ class OutboxRelay:
             ``True`` when published.
         """
         try:
-            await self._publish(message)
+            # Restore the context the event was staged under. `stage()` records
+            # it precisely so this is possible: without rebinding it, every log
+            # line the publisher and its downstream handlers emit is an orphan,
+            # and the trail from a user's request to the effect it eventually
+            # caused is broken exactly where an incident needs it most.
+            async with request_scope(
+                correlation_id=message.correlation_id,
+                tenant_id=message.tenant_id,
+            ):
+                await self._publish(message)
         except Exception as exc:  # noqa: BLE001 - one message must not stop the batch
             await self._record_failure(message, exc)
             return False

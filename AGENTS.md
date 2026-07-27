@@ -336,6 +336,45 @@ Before "fixing" any of these, read the comment next to them:
   before the transport runs, so holding it through a failure suppresses the
   queue retry the guard exists to enable — turning "the user gets a duplicate"
   into "the password reset never arrives".
+- **`StaleDataError` and unique-violation `IntegrityError` are translated to
+  409s** by handlers in `app/core/exceptions.py`. A concurrent edit or a
+  duplicate registration is a conflict the caller can act on, not a server
+  fault. Non-unique integrity errors (foreign key, check constraint) stay 500s
+  deliberately — those mean the application admitted data it should have
+  rejected, and reporting that as a routine conflict is how it goes unnoticed.
+- **Rate limiting resolves the route template *before* routing.** Middleware
+  runs above the router, so `scope["route"]` is still empty; the template is
+  found by matching the scope against `app.routes`. Without that,
+  `register_endpoint_limit` can never take effect.
+- **`ContextFilter` stamps `trace_id` via a lazy import.** `tracing` imports
+  `get_logger` from `logging`, so a module-level import would cycle — and
+  tracing is an optional extra.
+- **`scripts/worker.py` runs the outbox relay as well as the queue consumer.**
+  It has to run *somewhere*: a staged event that nothing publishes is silently
+  lost, which is the exact failure the outbox exists to prevent. Several relays
+  are safe — claiming uses `FOR UPDATE SKIP LOCKED`. `--no-relay` exists only
+  for splitting relays into separately scaled processes.
+- **The default outbox publisher enqueues onto the job queue** rather than
+  dispatching to the in-process event bus. The relay runs in a background
+  process, so "publish" must cross a process boundary, and the queue already
+  provides acknowledgement, backoff, a dead-letter destination and name-based
+  dispatch that needs no reconstruction of the original Python class from JSON.
+  Subscribe with `@tasks.register(outbox_task_name("your.event"))`.
+- **Reach the queue via `get_queue()`, never `from ... import queue`.** A
+  `from`-import binds the object at import time, so a later `set_queue` leaves
+  the importer holding the old one — in tests, the fake is installed and the
+  real Redis queue is used anyway.
+- **`tests/conftest.py` sets `DATABASE__URL` above its own app imports.** The
+  session module builds its engine at import time; without this the local `.env`
+  wins and any test using `session_scope()` reads and writes the *development*
+  database.
+- **A job carries `correlation_id` / `tenant_id` / `user_id` as stream fields.**
+  Captured by `Job.encode` at enqueue time — the last moment the context exists
+  — and rebound by the worker around the handler. Not decorative: a
+  `TenantRepository` reads the tenant from the ambient context, so a job
+  dispatched without one cannot do tenant-scoped work at all. The retry path
+  re-serialises them from the job rather than from ambient context, because it
+  runs outside the scope the handler ran under.
 - **`get_session` and `session_scope` publish buffered events themselves.** Do
   not call `flush_pending_events` after a commit as well — it would be a no-op,
   but the reason it is wired into the session helpers matters: leaving it to

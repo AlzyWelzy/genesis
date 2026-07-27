@@ -236,6 +236,21 @@ class InMemoryCache:
 cache: Cache = RedisCache()
 
 
+def get_cache() -> Cache:
+    """Return the current process-wide cache.
+
+    Reach the cache through this rather than ``from ... import cache``. A
+    ``from``-import binds the object into the importing module at import time,
+    so a later :func:`set_cache` rebinds only this module's name and leaves the
+    importer holding the previous instance — in tests, the in-memory fake is
+    installed and the real Redis cache is used anyway.
+
+    Matches ``get_queue``, ``get_redis``, ``get_storage``, ``get_email_provider``
+    and ``get_metrics``, which exist for the same reason.
+    """
+    return cache
+
+
 def set_cache(implementation: Cache) -> None:
     """Replace the process-wide cache.
 

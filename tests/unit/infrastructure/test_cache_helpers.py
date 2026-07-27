@@ -7,6 +7,8 @@ in the logs to say so.
 
 from uuid import uuid7
 
+import pytest
+
 from app.core.context import tenant_scope
 from app.infrastructure.redis.cache import build_cache_key, cached
 
@@ -111,3 +113,143 @@ class TestCachedDecorator:
             second = await value()
 
         assert first != second
+
+
+class TestStampedeProtection:
+    """``get_or_compute`` — real logic that had no test.
+
+    A cache stampede is worst precisely when it hurts most: a popular key
+    expires, every in-flight request misses simultaneously, and all of them run
+    the same expensive query. The moment the cache is least able to help is the
+    moment the database receives the most traffic.
+    """
+
+    @pytest.fixture
+    def lock_redis(self, monkeypatch):
+        """A stub Redis whose SET NX behaves like a real lock."""
+
+        class LockRedis:
+            def __init__(self) -> None:
+                self.keys: set[str] = set()
+
+            async def set(self, key, _value, nx=False, ex=None):
+                if nx and key in self.keys:
+                    return None
+                self.keys.add(key)
+                return True
+
+            async def delete(self, key) -> int:
+                self.keys.discard(key)
+                return 1
+
+        stub = LockRedis()
+        monkeypatch.setattr(
+            "app.infrastructure.redis.cache.get_redis", lambda: stub, raising=True
+        )
+        return stub
+
+    async def test_a_miss_computes_and_caches(self, fake_cache, lock_redis) -> None:
+        from app.infrastructure.redis.cache import get_or_compute
+
+        calls = 0
+
+        async def compute() -> dict:
+            nonlocal calls
+            calls += 1
+            return {"v": 1}
+
+        assert await get_or_compute("k", compute, ttl_seconds=30) == {"v": 1}
+        assert calls == 1
+        assert await fake_cache.get("k") == {"v": 1}
+
+    async def test_a_hit_does_not_compute(self, fake_cache, lock_redis) -> None:
+        from app.infrastructure.redis.cache import get_or_compute
+
+        await fake_cache.set("k", {"v": 1}, 30)
+
+        async def compute() -> dict:
+            raise AssertionError("must not be called on a hit")
+
+        assert await get_or_compute("k", compute, ttl_seconds=30) == {"v": 1}
+
+    async def test_concurrent_callers_compute_once(
+        self, fake_cache, lock_redis
+    ) -> None:
+        """The whole point: one query, not one per waiting request."""
+        import asyncio
+
+        from app.infrastructure.redis.cache import get_or_compute
+
+        calls = 0
+
+        async def compute() -> dict:
+            nonlocal calls
+            calls += 1
+            await asyncio.sleep(0)
+            return {"v": 1}
+
+        results = await asyncio.gather(
+            *(get_or_compute("k", compute, ttl_seconds=30) for _ in range(10))
+        )
+
+        assert all(r == {"v": 1} for r in results)
+        assert calls == 1
+
+    async def test_the_lock_is_released_after_computing(
+        self, fake_cache, lock_redis
+    ) -> None:
+        """A lock left behind blocks every later caller until it expires."""
+        from app.infrastructure.redis.cache import get_or_compute
+
+        async def compute() -> dict:
+            return {"v": 1}
+
+        await get_or_compute("k", compute, ttl_seconds=30)
+        assert lock_redis.keys == set()
+
+    async def test_the_lock_is_released_when_computing_raises(
+        self, fake_cache, lock_redis
+    ) -> None:
+        """Otherwise one failure wedges the key for the lock's whole timeout."""
+        from app.infrastructure.redis.cache import get_or_compute
+
+        async def broken() -> dict:
+            raise RuntimeError("query failed")
+
+        with pytest.raises(RuntimeError, match="query failed"):
+            await get_or_compute("k", broken, ttl_seconds=30)
+
+        assert lock_redis.keys == set()
+
+    async def test_a_lock_outage_computes_rather_than_failing(
+        self, fake_cache, monkeypatch
+    ) -> None:
+        """Stampede protection is an optimisation; it must never drop a request."""
+        from app.infrastructure.redis.cache import get_or_compute
+
+        class BrokenRedis:
+            async def set(self, *_args: object, **_kwargs: object) -> None:
+                raise ConnectionError("redis is down")
+
+            async def delete(self, *_args: object) -> None:
+                raise ConnectionError("redis is down")
+
+        broken = BrokenRedis()
+        monkeypatch.setattr(
+            "app.infrastructure.redis.cache.get_redis", lambda: broken, raising=True
+        )
+
+        async def compute() -> dict:
+            return {"v": 1}
+
+        assert await get_or_compute("k", compute, ttl_seconds=30) == {"v": 1}
+
+    async def test_a_none_result_is_not_cached(self, fake_cache, lock_redis) -> None:
+        """Caching ``None`` makes a miss indistinguishable from a stored absence."""
+        from app.infrastructure.redis.cache import get_or_compute
+
+        async def compute() -> None:
+            return None
+
+        assert await get_or_compute("k", compute, ttl_seconds=30) is None
+        assert await fake_cache.get("k") is None

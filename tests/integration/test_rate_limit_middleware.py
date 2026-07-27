@@ -124,3 +124,163 @@ class TestRateLimitResponses:
         for _ in range(10):
             response = await throttled_client.get("/live")
             assert response.status_code == 200
+
+
+class TestPerRouteLimits:
+    """Tighter limits declared per route, which were previously dead code.
+
+    ``register_endpoint_limit``, ``limit_for_route``, ``EndpointLimit.burst``
+    and ``check_token_bucket`` were all written, documented and unreachable: the
+    middleware only ever applied the global limit. A feature declaring a tighter
+    allowance for an expensive endpoint got no effect at all, silently — which
+    is worse than having no mechanism, because the protection is believed to be
+    in place.
+
+    The obstacle was real. Middleware runs above the router, so
+    ``scope["route"]`` is empty at the point the limiter needs it; the template
+    has to be resolved by matching the scope against the app's routes first.
+    """
+
+    @pytest.fixture
+    def endpoint_app(self, throttled_app):
+        """An app with two routes, one carrying a tighter limit."""
+        from app.infrastructure.redis.rate_limit import (
+            ENDPOINT_LIMITS,
+            EndpointLimit,
+            register_endpoint_limit,
+        )
+
+        app, init_redis = throttled_app
+
+        @app.get("/_t/expensive")
+        async def expensive() -> dict:
+            return {"ok": True}
+
+        @app.get("/_t/cheap")
+        async def cheap() -> dict:
+            return {"ok": True}
+
+        register_endpoint_limit("/_t/expensive", EndpointLimit(limit=1))
+        yield app, init_redis
+        ENDPOINT_LIMITS.clear()
+
+    @pytest.fixture
+    async def endpoint_client(self, endpoint_app):
+        from httpx import ASGITransport, AsyncClient
+
+        app, init_redis = endpoint_app
+        try:
+            await init_redis()
+        except Exception as exc:  # noqa: BLE001 - absence of Redis is a skip
+            pytest.skip(f"Redis unavailable: {exc}")
+
+        await _clear_rate_limits()
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://testserver"
+        ) as client:
+            yield client
+        await _clear_rate_limits()
+
+        from app.infrastructure.redis.client import close_redis
+
+        await close_redis()
+
+    async def test_the_tighter_limit_is_enforced(self, endpoint_client) -> None:
+        """One request allowed, the second refused — despite a global limit of 3."""
+        assert (await endpoint_client.get("/_t/expensive")).status_code == 200
+        assert (await endpoint_client.get("/_t/expensive")).status_code == 429
+
+    async def test_the_published_limit_is_the_route_s_own(
+        self, endpoint_client
+    ) -> None:
+        """A client reading the header must see the limit that applies to it."""
+        response = await endpoint_client.get("/_t/expensive")
+        assert response.headers["X-RateLimit-Limit"] == "1"
+
+    async def test_other_routes_keep_the_global_limit(self, endpoint_client) -> None:
+        """A tight limit on one endpoint must not throttle everything else."""
+        for _ in range(3):
+            assert (await endpoint_client.get("/_t/cheap")).status_code == 200
+
+    async def test_exhausting_a_route_does_not_block_other_routes(
+        self, endpoint_client
+    ) -> None:
+        """Per-route counters must be keyed separately, or they share a budget."""
+        await endpoint_client.get("/_t/expensive")
+        assert (await endpoint_client.get("/_t/expensive")).status_code == 429
+
+        assert (await endpoint_client.get("/_t/cheap")).status_code == 200
+
+    async def test_an_unmatched_path_still_falls_back_to_the_global_limit(
+        self, endpoint_client
+    ) -> None:
+        """An unrecognised path must be throttled, never exempt."""
+        for _ in range(3):
+            await endpoint_client.get("/api/v1/no-such-route")
+
+        response = await endpoint_client.get("/api/v1/no-such-route")
+        assert response.status_code == 429
+
+
+class TestBurstLimits:
+    """The token-bucket path, for endpoints where a short burst is legitimate."""
+
+    @pytest.fixture
+    def burst_app(self, throttled_app):
+        from app.infrastructure.redis.rate_limit import (
+            ENDPOINT_LIMITS,
+            EndpointLimit,
+            register_endpoint_limit,
+        )
+
+        app, init_redis = throttled_app
+
+        @app.get("/_t/sync")
+        async def sync_endpoint() -> dict:
+            return {"ok": True}
+
+        # A client syncing five records at startup then going quiet is exactly
+        # the shape a sliding window handles badly.
+        register_endpoint_limit(
+            "/_t/sync", EndpointLimit(limit=60, window_seconds=60, burst=5)
+        )
+        yield app, init_redis
+        ENDPOINT_LIMITS.clear()
+
+    @pytest.fixture
+    async def burst_client(self, burst_app):
+        from httpx import ASGITransport, AsyncClient
+
+        from app.infrastructure.redis.client import build_key, close_redis, get_redis
+
+        app, init_redis = burst_app
+        try:
+            await init_redis()
+        except Exception as exc:  # noqa: BLE001 - absence of Redis is a skip
+            pytest.skip(f"Redis unavailable: {exc}")
+
+        async for key in get_redis().scan_iter(match=build_key("bucket") + "*"):
+            await get_redis().delete(key)
+        await _clear_rate_limits()
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://testserver"
+        ) as client:
+            yield client
+
+        async for key in get_redis().scan_iter(match=build_key("bucket") + "*"):
+            await get_redis().delete(key)
+        await close_redis()
+
+    async def test_the_whole_burst_is_permitted_back_to_back(
+        self, burst_client
+    ) -> None:
+        """The point of a bucket: spend it all at once, then refill."""
+        for _ in range(5):
+            assert (await burst_client.get("/_t/sync")).status_code == 200
+
+    async def test_the_request_past_the_burst_is_refused(self, burst_client) -> None:
+        for _ in range(5):
+            await burst_client.get("/_t/sync")
+
+        assert (await burst_client.get("/_t/sync")).status_code == 429

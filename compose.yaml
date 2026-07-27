@@ -56,6 +56,11 @@ services:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+      # Creates `genesis_test` on first boot. Without it, `docker compose up`
+      # followed by `pytest` skips every integration test and still reports a
+      # green summary — the worst possible signal. Runs only when the volume is
+      # empty, so changing it needs `docker compose down -v`.
+      - ./docker/postgres-init:/docker-entrypoint-initdb.d:ro
     healthcheck:
       # `depends_on` alone only waits for the container to start, not for
       # PostgreSQL to accept connections — without this the API would race it

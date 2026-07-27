@@ -32,6 +32,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from app.core.config import settings
 from app.core.discovery import import_side_effect_modules
 from app.core.logging import configure_logging, get_logger
+from app.infrastructure.outbox.relay import OutboxRelay, publish_to_queue
 from app.infrastructure.queue.client import tasks
 from app.infrastructure.queue.worker import Worker
 from app.infrastructure.redis.client import close_redis, init_redis
@@ -55,25 +56,60 @@ def load_task_modules() -> None:
     )
 
 
-async def run(name: str, concurrency: int) -> None:
-    """Start the worker and run until interrupted."""
+async def run(name: str, concurrency: int, *, relay: bool = True) -> None:
+    """Start the worker and the outbox relay, and run until interrupted.
+
+    Both loops live in this process because both are background work with the
+    same lifecycle, and because the relay must run *somewhere*: a staged event
+    that nothing publishes is silently lost, which is precisely the failure the
+    outbox is built to prevent. Running it in the API process instead would tie
+    publication throughput to request-handling capacity and duplicate the work
+    across every replica.
+
+    Args:
+        name: Consumer name, unique per process.
+        concurrency: Jobs processed simultaneously.
+        relay: Run the outbox relay alongside the queue consumer. Turn it off
+            only to run relays as separate, independently scaled processes —
+            never because it seems optional. Several relays are safe: claiming
+            uses ``FOR UPDATE SKIP LOCKED``.
+    """
     configure_logging()
     load_task_modules()
 
     await init_redis()
     worker = Worker(tasks, name=name, concurrency=concurrency)
+    outbox_relay = OutboxRelay(publish_to_queue) if relay else None
+
+    def stop() -> None:
+        worker.stop()
+        if outbox_relay is not None:
+            outbox_relay.stop()
 
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):
-        loop.add_signal_handler(sig, worker.stop)
+        loop.add_signal_handler(sig, stop)
 
     logger.info(
         "Worker process starting",
-        extra={"worker": name, "environment": settings.app.environment},
+        extra={
+            "worker": name,
+            "environment": settings.app.environment,
+            "outbox_relay": relay,
+        },
     )
+    loops = [worker.run()]
+    if outbox_relay is not None:
+        loops.append(outbox_relay.run())
+
     try:
-        await worker.run()
+        # Neither loop returns normally, so a completed task means one of them
+        # died. Surfacing that rather than waiting on the survivor is what makes
+        # a wedged relay visible: a process that is half-running still passes
+        # every liveness check while events pile up unpublished.
+        await asyncio.gather(*loops)
     finally:
+        stop()
         await close_redis()
         logger.info("Worker process stopped")
 
@@ -93,10 +129,17 @@ def main() -> None:
         default=4,
         help="Jobs processed simultaneously (default: 4).",
     )
+    parser.add_argument(
+        "--no-relay",
+        action="store_true",
+        help="Do not run the outbox relay in this process. Only for splitting "
+        "relays into separately scaled processes — a deployment where no "
+        "process runs a relay loses every durable event, silently.",
+    )
     args = parser.parse_args()
 
     with contextlib.suppress(KeyboardInterrupt):
-        asyncio.run(run(args.name, args.concurrency))
+        asyncio.run(run(args.name, args.concurrency, relay=not args.no_relay))
 
 
 if __name__ == "__main__":

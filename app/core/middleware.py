@@ -33,6 +33,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.cors import CORSMiddleware
 from starlette.middleware.gzip import GZipMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
+from starlette.routing import Match
 
 from app.common.constants import CORRELATION_ID_HEADER, REQUEST_ID_HEADER
 from app.core.config import settings
@@ -44,7 +45,13 @@ from app.infrastructure.observability.metrics import (
     HTTP_REQUESTS,
     get_metrics,
 )
-from app.infrastructure.redis.rate_limit import check_rate_limit, resolve_limit
+from app.infrastructure.redis.rate_limit import (
+    EndpointLimit,
+    RateLimitResult,
+    check_rate_limit,
+    check_token_bucket,
+    limit_for_route,
+)
 
 logger = get_logger(__name__)
 
@@ -171,11 +178,9 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
             return await call_next(request)
 
         identity, authenticated = _resolve_identity(request)
-        result = await check_rate_limit(
-            identity,
-            limit=resolve_limit(authenticated=authenticated),
-            window_seconds=settings.rate_limit.window_seconds,
-        )
+        route = _prerouting_template(request)
+        limit = limit_for_route(route, authenticated=authenticated)
+        result = await _check(identity, route, limit)
 
         if not result.allowed:
             # Returned, NOT raised. An exception raised inside a
@@ -203,6 +208,55 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         # client can slow down *before* it gets a 429.
         response.headers.update(result.headers())
         return response
+
+
+async def _check(identity: str, route: str, limit: EndpointLimit) -> RateLimitResult:
+    """Apply whichever algorithm the route's limit calls for.
+
+    A per-route limit is keyed by ``identity`` *and* route. Keying it by
+    identity alone would make the tight limit on one expensive endpoint share a
+    counter with every ordinary read the same caller makes — so the expensive
+    endpoint would be throttled by unrelated traffic, and its own allowance
+    would silently consume everyone else's.
+
+    The global limit keeps the bare identity as its key, so it still counts a
+    caller's whole footprint across every route.
+    """
+    if limit.burst is None:
+        return await check_rate_limit(
+            identity,
+            limit=limit.limit,
+            window_seconds=limit.window_seconds,
+        )
+
+    return await check_token_bucket(
+        f"{identity}:{route}",
+        rate=limit.limit / limit.window_seconds,
+        burst=limit.burst,
+        window_seconds=limit.window_seconds,
+    )
+
+
+def _prerouting_template(request: Request) -> str:
+    """Resolve the matched route's template *before* routing has run.
+
+    Middleware sits above the router, so ``scope["route"]`` — which
+    :func:`_route_template` reads — is not populated yet. Without resolving it
+    here, a per-route rate limit can never apply, because the limiter runs at a
+    point where it does not yet know which route it is limiting.
+
+    Matching is done by asking each route whether it would accept the scope,
+    which is exactly what the router itself is about to do, and costs a regex
+    match per route. Falls back to ``"unmatched"``, which
+    :func:`~app.infrastructure.redis.rate_limit.limit_for_route` maps to the
+    global limit — so an unrecognised path is still throttled rather than
+    exempt.
+    """
+    for route in request.app.routes:
+        match, _ = route.matches(request.scope)
+        if match == Match.FULL:
+            return getattr(route, "path", None) or "unmatched"
+    return "unmatched"
 
 
 def _route_template(request: Request) -> str:

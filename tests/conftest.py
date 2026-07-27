@@ -33,27 +33,49 @@ from uuid import UUID, uuid7
 
 import pytest
 
-from app.infrastructure.email.providers import (
-    CollectingEmailProvider,
-    set_email_provider,
-)
-from app.infrastructure.observability.metrics import (
-    NoOpMetrics,
-    RecordingMetrics,
-    set_metrics,
-)
-from app.infrastructure.queue.client import InMemoryQueue, set_queue
-from app.infrastructure.redis.cache import InMemoryCache, set_cache
-
 #: Set from ``TEST_DATABASE_URL`` when present, so CI can point at its own
 #: service container without editing anything.
-#: Resolved at import so the async fixture performs no filesystem I/O.
-ALEMBIC_INI = Path(__file__).resolve().parent.parent / "alembic.ini"
-
 TEST_DATABASE_URL = os.environ.get(
     "TEST_DATABASE_URL",
     "postgresql+asyncpg://postgres:postgres@localhost:5432/genesis_test",
 )
+
+# Point the *application's* settings at the test database, before anything
+# imports them.
+#
+# This has to happen here, above the app imports, because
+# `app.infrastructure.database.session` builds its engine at import time from
+# `settings.database.url`. Without this the local `.env` wins and that
+# module-level engine connects to the **development** database — so any test
+# exercising code that opens its own `session_scope()` (the outbox relay, a
+# queue handler, a script) reads and writes a developer's real data. It shows
+# up first as a baffling "relation does not exist", and the benign version of
+# that is the lucky one.
+#
+# `setdefault`, so an explicit DATABASE__URL — CI's service container — still
+# wins.
+os.environ.setdefault("DATABASE__URL", TEST_DATABASE_URL)
+
+from app.infrastructure.email.providers import (  # noqa: E402 - must follow the env setup
+    CollectingEmailProvider,
+    set_email_provider,
+)
+from app.infrastructure.observability.metrics import (  # noqa: E402 - see above
+    NoOpMetrics,
+    RecordingMetrics,
+    set_metrics,
+)
+from app.infrastructure.queue.client import (  # noqa: E402 - see above
+    InMemoryQueue,
+    set_queue,
+)
+from app.infrastructure.redis.cache import (  # noqa: E402 - see above
+    InMemoryCache,
+    set_cache,
+)
+
+#: Resolved at import so the async fixture performs no filesystem I/O.
+ALEMBIC_INI = Path(__file__).resolve().parent.parent / "alembic.ini"
 
 #: Marks tests that need a real PostgreSQL. Collected but skipped when the
 #: database is unreachable, so `pytest` on a laptop with nothing running still
@@ -226,6 +248,34 @@ async def database_engine(migrated_database: str) -> AsyncIterator[object]:
     engine = create_async_engine(migrated_database, poolclass=None)
     yield engine
     await engine.dispose()
+
+
+@pytest.fixture
+async def shared_engine(migrated_database: str) -> AsyncIterator[None]:
+    """Make the module-level engine usable from *this* test's event loop.
+
+    Most database tests take the ``session`` fixture, which builds its own
+    engine and rolls back. That does not work for anything exercising code
+    which opens its own ``session_scope()`` — the outbox relay, a queue handler,
+    a script — because the relay must see *committed* rows, and a session it did
+    not create cannot give it those.
+
+    Such code reaches ``app.infrastructure.database.session.engine``, created at
+    import time and bound to whichever loop first used it. pytest-asyncio gives
+    every test a fresh loop, so the second test to touch it fails deep inside
+    asyncpg with "Event loop is closed" — a traceback that says nothing about
+    the actual cause.
+
+    Disposing on both sides forces the pool to reconnect on the current loop.
+
+    Tests using this fixture are responsible for their own cleanup: they commit,
+    so nothing is rolled back for them.
+    """
+    from app.infrastructure.database.session import dispose_engine
+
+    await dispose_engine()
+    yield
+    await dispose_engine()
 
 
 @pytest.fixture

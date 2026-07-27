@@ -209,4 +209,11 @@ def safe_join(root: Path, key: str) -> Path:
     candidate = (root_resolved / key).resolve()
     if not candidate.is_relative_to(root_resolved):
         raise ValueError(f"Path escapes the storage root: {key}")
+    # `""`, `"."` and `"a/.."` all resolve to the root itself. That is *inside*
+    # the root, so the check above passes — and the caller then tries to write
+    # to, or unlink, a directory. The result is an uncaught `IsADirectoryError`
+    # and a 500 for what is really a malformed key. A storage key names an
+    # object; it can never name the root.
+    if candidate == root_resolved:
+        raise ValueError(f"Storage key does not name an object: {key!r}")
     return candidate

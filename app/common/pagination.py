@@ -169,7 +169,20 @@ class CursorPage[T](BaseModel):
 
 #: Bumped whenever the cursor payload's meaning changes. An older cursor is
 #: then rejected with a clear error instead of paging from the wrong place.
-CURSOR_VERSION: Final[int] = 1
+#:
+#: v2 changed the wire format: the signature is now appended with no separator
+#: and split off by its fixed length. v1 used a ``.`` between payload and
+#: signature and recovered the split with ``rpartition``, which finds the *last*
+#: dot — and the signature is raw bytes, so roughly one signature in sixteen
+#: contains ``0x2e`` and was split in the wrong place. Around 7% of cursors were
+#: therefore rejected as forged, at random, and a client paginating hit a
+#: spurious "invalid cursor" about one page in fourteen.
+CURSOR_VERSION: Final[int] = 2
+
+#: Bytes of HMAC kept. 128 bits is far beyond what forging a pagination cursor
+#: is worth, and keeps the cursor short enough to sit in a URL comfortably.
+#: Fixed, which is what lets the signature be split off by length.
+_SIGNATURE_BYTES: Final[int] = 16
 
 
 def encode_cursor(values: Mapping[str, Any], *, secret: str) -> str:
@@ -190,8 +203,20 @@ def encode_cursor(values: Mapping[str, Any], *, secret: str) -> str:
         separators=(",", ":"),
         sort_keys=True,
     ).encode()
-    signature = hmac.new(secret.encode(), payload, hashlib.sha256).digest()[:16]
-    return base64.urlsafe_b64encode(payload + b"." + signature).decode().rstrip("=")
+    # Concatenated with no separator. Any delimiter byte can also occur inside
+    # the signature, which is raw HMAC output — and then splitting on the
+    # delimiter finds the wrong boundary and rejects a cursor we ourselves just
+    # minted. The signature has a fixed length, so the boundary is known without
+    # marking it.
+    signature = _sign(payload, secret)
+    return base64.urlsafe_b64encode(payload + signature).decode().rstrip("=")
+
+
+def _sign(payload: bytes, secret: str) -> bytes:
+    """Return the truncated HMAC for a cursor payload."""
+    return hmac.new(secret.encode(), payload, hashlib.sha256).digest()[
+        :_SIGNATURE_BYTES
+    ]
 
 
 def decode_cursor(cursor: str, *, secret: str) -> dict[str, Any]:
@@ -229,12 +254,14 @@ def _decode_cursor_payload(cursor: str, secret: str) -> dict[str, Any] | None:
     except ValueError, TypeError:
         return None
 
-    payload, separator, signature = raw.rpartition(b".")
-    if not payload or not separator:
+    if len(raw) <= _SIGNATURE_BYTES:
         return None
+    payload, signature = raw[:-_SIGNATURE_BYTES], raw[-_SIGNATURE_BYTES:]
 
-    expected = hmac.new(secret.encode(), payload, hashlib.sha256).digest()[:16]
-    if not hmac.compare_digest(expected, signature):
+    # Constant time: a byte-by-byte comparison that returns early leaks how much
+    # of a forged signature was correct, which is enough to build one a byte at
+    # a time.
+    if not hmac.compare_digest(_sign(payload, secret), signature):
         return None
 
     try:

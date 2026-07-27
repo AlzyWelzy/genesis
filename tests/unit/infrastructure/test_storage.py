@@ -5,6 +5,7 @@ in every upload flow, and a provider that resolves ``../`` writes wherever the
 process can write.
 """
 
+import asyncio
 from collections.abc import AsyncIterator
 from pathlib import Path
 
@@ -209,3 +210,46 @@ class TestUrlSigningSecret:
             f"secret-doc.pdf:{expires}".encode(), settings.redis.key_prefix
         )
         assert provider.verify_presigned("secret-doc.pdf", expires, forged) is False
+
+
+class TestDegenerateKeys:
+    """Keys that name the root rather than an object.
+
+    ``""``, ``"."`` and ``"a/.."`` all resolve to the storage root. That is
+    *inside* the root, so the traversal check passes — and the provider then
+    tries to write to, or unlink, a directory. The result was an uncaught
+    ``IsADirectoryError`` and a 500 for what is really a malformed key.
+
+    Reachable as soon as a feature builds a key from user input and any
+    component of it comes back empty.
+    """
+
+    @pytest.mark.parametrize("key", ["", ".", "a/..", "./", "a/b/../.."])
+    async def test_a_key_naming_the_root_is_refused(
+        self, provider: LocalStorageProvider, key: str
+    ) -> None:
+        with pytest.raises(ValueError, match="does not name an object"):
+            await provider.upload(key, b"x", content_type="text/plain")
+
+    async def test_deleting_with_a_root_key_does_not_touch_the_root(
+        self, provider: LocalStorageProvider, storage_root: Path
+    ) -> None:
+        """The dangerous direction: unlinking the store itself."""
+        with pytest.raises(ValueError, match="does not name an object"):
+            await provider.delete("")
+
+        # Checked off the event loop: the lint rule that flags blocking pathlib
+        # calls in async functions is right, and it applies to tests too.
+        assert await asyncio.to_thread(storage_root.is_dir)
+
+    async def test_exists_reports_false_rather_than_raising(
+        self, provider: LocalStorageProvider
+    ) -> None:
+        """``exists`` already treats an unusable key as absence; keep that."""
+        assert await provider.exists("") is False
+
+    async def test_an_ordinary_key_still_works(
+        self, provider: LocalStorageProvider
+    ) -> None:
+        stored = await provider.upload("a/b.txt", b"x", content_type="text/plain")
+        assert stored.key == "a/b.txt"

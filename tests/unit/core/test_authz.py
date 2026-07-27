@@ -170,3 +170,77 @@ class TestGuards:
 
         principal = StubPrincipal(is_superuser=True)
         assert await require_superuser()(principal) is principal
+
+
+class TestMalformedClaims:
+    """A verified signature says the payload is *ours*, not that it is well-formed.
+
+    Every one of these previously escaped ``decode_token`` as a ``ValueError`` or
+    ``TypeError``, becoming a 500 with a traceback rather than a 401 — which both
+    reports a bad credential as a server fault and breaks the documented promise
+    that no reason for rejection is exposed.
+    """
+
+    @staticmethod
+    def _signed(**extra: object) -> str:
+        """Mint a correctly signed token carrying deliberately odd claims."""
+        import datetime as dt
+
+        import jwt
+
+        from app.core.config import settings
+        from app.core.security.keys import get_signing_key
+
+        key = get_signing_key()
+        now = dt.datetime.now(dt.UTC)
+        payload = {
+            "sub": "u",
+            "iss": settings.jwt.issuer,
+            "aud": settings.jwt.audience,
+            "iat": now,
+            "exp": now + dt.timedelta(minutes=5),
+            "jti": "j",
+            "type": "access",
+        }
+        payload.update(extra)
+        return jwt.encode(
+            payload,
+            key.private_pem,
+            algorithm=settings.jwt.algorithm,
+            headers={"kid": key.key_id},
+        )
+
+    @pytest.mark.parametrize(
+        ("label", "claims"),
+        [
+            ("tenant id that is not a uuid", {"tid": "not-a-uuid"}),
+            ("issued-at beyond datetime range", {"iat": 10**20}),
+            ("scopes as an integer", {"scopes": 5}),
+        ],
+    )
+    def test_a_malformed_claim_is_an_invalid_token_not_a_crash(
+        self, label: str, claims: dict
+    ) -> None:
+        from app.core.security.tokens import InvalidTokenError, decode_token
+
+        with pytest.raises(InvalidTokenError):
+            decode_token(self._signed(**claims))
+
+    def test_scopes_as_a_bare_string_is_rejected(self) -> None:
+        """A bare string scope must be rejected, not split into characters.
+
+        ``tuple("admin")`` is ``('a','d','m','i','n')`` — five scopes matching
+        nothing, so the token grants silently less than intended instead of
+        failing.
+        """
+        from app.core.security.tokens import InvalidTokenError, decode_token
+
+        with pytest.raises(InvalidTokenError):
+            decode_token(self._signed(scopes="admin"))
+
+    def test_a_well_formed_token_still_decodes(self) -> None:
+        from app.core.security.tokens import decode_token
+
+        claims = decode_token(self._signed())
+        assert claims.subject == "u"
+        assert claims.scopes == ()

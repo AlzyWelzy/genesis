@@ -199,6 +199,16 @@ def create_refresh_token(
     )
 
 
+def _reject_string_scopes(scopes: object) -> None:
+    """Refuse a ``scopes`` claim that is a bare string rather than a sequence.
+
+    Raises:
+        InvalidTokenError: When ``scopes`` is a string.
+    """
+    if isinstance(scopes, str):
+        raise InvalidTokenError
+
+
 def decode_token(token: str, *, expected_type: str | None = None) -> TokenClaims:
     """Verify a token's signature and registered claims.
 
@@ -235,15 +245,31 @@ def decode_token(token: str, *, expected_type: str | None = None) -> TokenClaims
     if expected_type is not None and payload.get("type") != expected_type:
         raise InvalidTokenError
 
-    tenant_raw = payload.get("tid")
-    return TokenClaims(
-        subject=payload["sub"],
-        token_type=payload["type"],
-        token_id=payload["jti"],
-        token_version=payload.get(settings.security.token_version_claim, 0),
-        tenant_id=UUID(tenant_raw) if tenant_raw else None,
-        scopes=tuple(payload.get("scopes", ())),
-        issued_at=datetime.fromtimestamp(payload["iat"], UTC),
-        expires_at=datetime.fromtimestamp(payload["exp"], UTC),
-        raw=payload,
-    )
+    # Building the claims is inside the guard too, not just the signature check.
+    # A verified signature says the payload is *ours*, not that every field is
+    # well-formed — a `tid` that is not a UUID, an `iat` outside the range of a
+    # datetime, or `scopes` that is a string rather than a list all raise here.
+    # Uncaught, each becomes a 500 with a traceback instead of a 401, which both
+    # breaks the "no reason is exposed" contract above and reports a bad
+    # credential as a server fault.
+    try:
+        tenant_raw = payload.get("tid")
+        scopes = payload.get("scopes", ())
+        # A single scope serialised as a bare string would otherwise become one
+        # entry per character, silently granting nothing that matches.
+        _reject_string_scopes(scopes)
+        return TokenClaims(
+            subject=payload["sub"],
+            token_type=payload["type"],
+            token_id=payload["jti"],
+            token_version=payload.get(settings.security.token_version_claim, 0),
+            tenant_id=UUID(tenant_raw) if tenant_raw else None,
+            scopes=tuple(scopes),
+            issued_at=datetime.fromtimestamp(payload["iat"], UTC),
+            expires_at=datetime.fromtimestamp(payload["exp"], UTC),
+            raw=payload,
+        )
+    except InvalidTokenError:
+        raise
+    except (ValueError, TypeError, OverflowError, OSError, AttributeError) as exc:
+        raise InvalidTokenError from exc

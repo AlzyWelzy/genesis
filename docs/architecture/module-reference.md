@@ -486,6 +486,31 @@ read-modify-write cannot interleave.
 never learns. `RedisStreamsPubSub` keeps a capped log a reconnecting subscriber
 can resume from, turning "lost on disconnect" into "lost after N messages".
 
+**`pagination.py`** — cursors are opaque, versioned and HMAC-signed. The
+signature is appended with **no delimiter** and split off by its fixed length.
+That is not a style choice: v1 separated payload from signature with `.` and
+recovered the split using `rpartition`, which finds the *last* dot — and since
+the signature is raw HMAC bytes, roughly one in sixteen contains `0x2e`. About
+7% of cursors were then verified against the wrong payload and rejected as
+forged, so a client paginating hit a spurious "invalid cursor" about one page in
+fourteen: intermittent, unreproducible from any single example, and
+indistinguishable in the logs from a genuine tampering attempt. Any delimiter
+would have the same flaw; the length is what makes the boundary unambiguous.
+
+**`tokens.py`** — claim construction happens *inside* the guarded block, not
+only the signature check. A valid signature proves the payload is ours; it does
+not prove every field is well-formed. A `tid` that is not a UUID, an `iat`
+outside datetime's range, or a `scopes` claim that is a bare string (which
+`tuple()` would silently explode into one scope per character) each become an
+`InvalidTokenError` and a 401, rather than escaping as a `ValueError` and
+becoming a 500 with a traceback.
+
+**`utils/files.py`** — `safe_join` refuses both escape *and* a key that resolves
+to the root itself. `""`, `"."` and `"a/.."` are all inside the root, so the
+traversal check passes; the caller then writes to or unlinks a directory, which
+surfaces as an uncaught `IsADirectoryError`. A storage key names an object and
+can never name the root.
+
 Two database exceptions are translated at the edge rather than falling through
 to the catch-all handler. `StaleDataError` — an optimistic-lock version check
 that lost its race — becomes a 409 `stale_data`, because the caller's request was

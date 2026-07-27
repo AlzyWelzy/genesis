@@ -336,6 +336,18 @@ Before "fixing" any of these, read the comment next to them:
   before the transport runs, so holding it through a failure suppresses the
   queue retry the guard exists to enable — turning "the user gets a duplicate"
   into "the password reset never arrives".
+- **A cursor's signature is split off by *length*, never by a delimiter.** The
+  signature is raw HMAC bytes and can contain any byte, including whatever you
+  chose as a separator — v1 used `.` with `rpartition`, and ~7% of cursors were
+  rejected as forged at random. `CURSOR_VERSION` is 2; do not reintroduce a
+  delimiter.
+- **`decode_token` builds its claims inside the try block.** A verified
+  signature means the payload is *ours*, not that every field is well-formed; a
+  malformed `tid` or `scopes` would otherwise escape as a `ValueError` and
+  become a 500 instead of a 401.
+- **`safe_join` rejects a key resolving to the root itself.** `""`, `"."` and
+  `"a/.."` pass the traversal check — they are inside the root — and then the
+  caller writes to or unlinks a directory.
 - **`StaleDataError` and unique-violation `IntegrityError` are translated to
   409s** by handlers in `app/core/exceptions.py`. A concurrent edit or a
   duplicate registration is a conflict the caller can act on, not a server

@@ -207,3 +207,76 @@ class TestCursorEncoding:
                 secret=self.SECRET,
             )
         assert garbage.value.code == wrong_secret.value.code
+
+
+class TestCursorRoundTripReliability:
+    """A cursor we just minted must always verify. It did not.
+
+    v1 appended the signature after a ``.`` and recovered the split with
+    ``rpartition``, which finds the *last* dot. The signature is raw HMAC bytes,
+    so roughly one in sixteen contains ``0x2e`` — and then the split landed
+    inside the signature, the HMAC was computed over the wrong payload, and a
+    perfectly valid cursor was rejected as forged.
+
+    About 7% of cursors were affected, at random, so a client paginating hit a
+    spurious "invalid cursor" roughly one page in fourteen. Intermittent,
+    unreproducible from any single example, and indistinguishable from a real
+    tampering attempt in the logs.
+
+    A property test rather than a fixed example: a single hand-picked cursor
+    reproduces this only 7% of the time, which is exactly how it survived.
+    """
+
+    SECRET = "test-signing-secret"
+
+    def test_every_cursor_round_trips(self) -> None:
+        from uuid import uuid7
+
+        from app.common.pagination import decode_cursor, encode_cursor
+
+        for i in range(2000):
+            values = {"id": str(uuid7()), "n": i}
+            cursor = encode_cursor(values, secret=self.SECRET)
+            assert decode_cursor(cursor, secret=self.SECRET) == values
+
+    def test_payload_values_containing_a_dot_round_trip(self) -> None:
+        """The delimiter could collide from the payload side too."""
+        from app.common.pagination import decode_cursor, encode_cursor
+
+        values = {"email": "a.b@example.com", "ts": "2026-01-15T10:30:00.123+00:00"}
+        cursor = encode_cursor(values, secret=self.SECRET)
+        assert decode_cursor(cursor, secret=self.SECRET) == values
+
+    def test_a_wrong_secret_is_still_rejected(self) -> None:
+        """Fixing the split must not have weakened verification."""
+        from app.common.pagination import _decode_cursor_payload, encode_cursor
+
+        cursor = encode_cursor({"id": "a"}, secret=self.SECRET)
+        assert _decode_cursor_payload(cursor, "different-secret") is None
+
+    def test_a_truncated_cursor_is_rejected(self) -> None:
+        """Shorter than the signature means there is no payload to verify."""
+        import base64
+
+        from app.common.pagination import _decode_cursor_payload
+
+        stub = base64.urlsafe_b64encode(b"tiny").decode().rstrip("=")
+        assert _decode_cursor_payload(stub, self.SECRET) is None
+
+    def test_an_empty_cursor_is_rejected(self) -> None:
+        from app.common.pagination import _decode_cursor_payload
+
+        assert _decode_cursor_payload("", self.SECRET) is None
+
+    def test_a_v1_cursor_is_rejected_rather_than_misread(self) -> None:
+        """The format changed, so old cursors must fail cleanly."""
+        import base64
+        import json
+
+        from app.common.pagination import _decode_cursor_payload
+
+        payload = json.dumps({"v": 1, "k": {"id": "a"}}, separators=(",", ":")).encode()
+        legacy = (
+            base64.urlsafe_b64encode(payload + b"." + b"0" * 16).decode().rstrip("=")
+        )
+        assert _decode_cursor_payload(legacy, self.SECRET) is None

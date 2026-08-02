@@ -517,6 +517,34 @@ class Settings(BaseSettings):
         if self.database.echo:
             problems.append("DATABASE__ECHO must be false in production")
 
+        # The development providers. Both fail *silently* in production, which
+        # is what makes them worth refusing to boot over rather than warning
+        # about:
+        #
+        # `local` storage writes to the container's own disk, so every upload is
+        # invisible to the other replicas and vanishes on the next restart. The
+        # provider's own docstring says never to deploy it, and nothing enforced
+        # that.
+        #
+        # `console` email logs the message instead of sending it. Every password
+        # reset, verification link and receipt simply never arrives, with a
+        # cheerful INFO line for each one.
+        #
+        # Neither produces an error, a failed request or a metric. The first
+        # signal is a customer asking where their file or their email went.
+        if self.storage.provider == "local":
+            problems.append(
+                "STORAGE__PROVIDER must not be 'local' in production — uploads "
+                "would be written to container-local disk, invisible to other "
+                "replicas and lost on restart"
+            )
+        if self.email.provider == "console":
+            problems.append(
+                "EMAIL__PROVIDER must not be 'console' in production — messages "
+                "would be logged instead of sent, so no password reset or "
+                "verification email ever arrives"
+            )
+
         if problems:
             raise ValueError(
                 "Unsafe production configuration:\n  - " + "\n  - ".join(problems)

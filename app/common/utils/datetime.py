@@ -92,6 +92,18 @@ def end_of_day(value: date | datetime) -> datetime:
     the final second, and at microsecond precision that is a real loss — it is
     why daily totals fail to sum to the monthly one.
 
+    **Compare with ``<``, never ``<=``, and never SQL ``BETWEEN``.** The returned
+    instant belongs to the *next* day, so::
+
+        WHERE ts BETWEEN start_of_day(d) AND end_of_day(d)   -- wrong
+
+    counts a row landing exactly on midnight in both days' totals, because SQL
+    ``BETWEEN`` is inclusive at both ends. The correct form is half-open::
+
+        WHERE ts >= start_of_day(d) AND ts < end_of_day(d)   -- right
+
+    which is also what makes consecutive days tile the timeline exactly once.
+
     Args:
         value: A date, or a datetime whose date part is used.
 

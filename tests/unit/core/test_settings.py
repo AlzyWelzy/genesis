@@ -21,6 +21,12 @@ _SAFE_PRODUCTION: dict[str, dict[str, object]] = {
     "database": {"url": "postgresql+asyncpg://u:p@db:5432/genesis", "echo": False},
     "logging": {"json_format": True, "log_request_body": False},
     "rate_limit": {"enabled": True},
+    # The real providers. Omitting these leaves the *development* defaults —
+    # `local` storage and `console` email — which the validator now refuses,
+    # correctly: local storage loses every upload on restart and console email
+    # sends nothing at all, both silently.
+    "storage": {"provider": "s3", "bucket": "genesis-uploads"},
+    "email": {"provider": "smtp", "smtp_host": "smtp.example.com"},
 }
 
 

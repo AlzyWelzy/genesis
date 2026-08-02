@@ -198,3 +198,45 @@ and never reaches its block duration.
   asserts only that we called the methods we thought we called.
 * **Exceed the pool size.** Below `max_connections`, every Redis test passes on a
   broken pool — which is exactly how that bug survived.
+
+
+## Why bugs kept appearing, and what closed it
+
+Seven review passes each found bugs the previous pass could not have found. That
+was not carelessness; it was structural. Each pass explored a different
+**dimension of failure**, and a technique is blind to every dimension it does not
+address. The dimensions are finite, so enumerating them is what ends the cycle.
+
+| # | Dimension | The question | Covered by | Bugs found |
+|---|---|---|---|---|
+| 1 | Existence | Is the code reachable at all? | Unwired-symbol sweep + CI | 12 |
+| 2 | Logic | Correct for a chosen input? | `tests/unit`, `tests/integration` | 6 |
+| 3 | Input space | Correct for *every* input? | `tests/property` | 5 |
+| 4 | Concurrency | Correct when interleaved? | `tests/concurrency` | 2 |
+| 5 | Resource lifecycle | Released, not just acquired? | `test_resource_lifecycle.py` | 0 |
+| 6 | Dependency failure | Correct when Redis or PG is gone? | `test_dependency_failure.py` | 0 |
+| 7 | Configuration | Is every setting combination safe? | `tests/config` | 1 |
+| 8 | Time | Correct across boundaries and eras? | `test_time_properties.py` | 0 |
+
+The instructive part is *where* the bugs sat. Dimension 1 found unwired code —
+the outbox relay nothing ran, events nothing delivered. Dimension 3 found code
+that was wired, covered and passing, but wrong for inputs nobody wrote: a cursor
+rejected 7% of the time, a payload that could not encode a `date`. Dimension 4
+found code correct in isolation and wrong together: a connection pool that failed
+open, so the rate limiter stopped limiting under exactly the load it exists for.
+
+Each was invisible to every earlier technique, and each is now covered by a
+permanent suite rather than by having been looked for once.
+
+### What this does not cover
+
+Three dimensions remain, and none is closeable by a test suite on a laptop:
+
+* **Sustained load** — leaks and drift that need hours, not seconds.
+* **Real infrastructure failure** — partitions, disk exhaustion, clock skew
+  between hosts. Chaos testing against a deployed environment.
+* **Emergent behaviour** — the whole system meeting real traffic.
+
+That is the honest boundary. Everything inside it now has a suite that runs on
+every commit; everything outside it needs an environment this repository does not
+have.

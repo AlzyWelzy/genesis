@@ -327,9 +327,50 @@ here: the guarantees under test are *theirs*.
 
 ---
 
+## 9b. The eight dimensions
+
+Bugs kept appearing across review passes because each pass explored a different
+*dimension of failure*, and a technique is blind to every dimension it does not
+address. All eight now have a permanent suite. **When adding a feature, ask which
+dimensions it touches** rather than only "did I write a test".
+
+| Dimension | Suite | Ask |
+|---|---|---|
+| Existence | CI + `scripts/check_dependency_rule.sh` | Is it wired to anything? |
+| Logic | `tests/unit`, `tests/integration` | Right for a chosen input? |
+| Input space | `tests/property` | Right for *every* input? |
+| Concurrency | `tests/concurrency` | Right when two run at once? |
+| Resource lifecycle | `tests/concurrency/test_resource_lifecycle.py` | Released, not just acquired? |
+| Dependency failure | `tests/concurrency/test_dependency_failure.py` | Right when Redis or PG is gone? |
+| Configuration | `tests/config` | Is every setting combination safe to deploy? |
+| Time | `tests/property/test_time_properties.py` | Right across boundaries and eras? |
+
+A new setting means a `tests/config` case. A new Redis-backed control means a
+concurrency case *above the pool size*. A new encoder means a property. A new
+background loop means a lifecycle check.
+
+```bash
+uv run pytest tests/property                              # 50 examples
+HYPOTHESIS_PROFILE=ci uv run pytest tests/property        # 500 — what CI runs
+HYPOTHESIS_PROFILE=thorough uv run pytest tests/property  # 5000 — a hunt
+```
+
+See `docs/architecture/testing-strategy.md` for what this deliberately does not
+cover, and why.
+
+---
+
 ## 10. Things that look wrong but are not
 
 Before "fixing" any of these, read the comment next to them:
+
+- **The production validator refuses `local` storage and `console` email.** Both
+  fail *silently* in production — uploads land on container-local disk and
+  vanish on restart; email is logged instead of sent. Refusing to boot is the
+  point: a failed deploy beats a silent breach.
+- **`end_of_day` returns the *next* midnight.** Exclusive on purpose; an
+  inclusive `23:59:59` drops the final second. Compare with `<`, never SQL
+  `BETWEEN`, which is inclusive at both ends and double-counts midnight.
 
 - **`app/modules/` is empty.** Stage 2 has not started.
 - **Lazy imports in `app/infrastructure/observability/`.** Those packages are

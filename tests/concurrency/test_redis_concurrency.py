@@ -8,6 +8,8 @@ atomicity is there, so they are only meaningfully testable this way.
 import asyncio
 
 import pytest
+from fastapi import FastAPI
+from httpx import AsyncClient
 
 from app.infrastructure.email.client import EmailMessage
 from app.infrastructure.email.providers import claim_send
@@ -203,3 +205,124 @@ class TestConnectionPoolBackpressure:
         claims = await asyncio.gather(*(claim_send(message) for _ in range(attempts)))
 
         assert sum(1 for claimed in claims if claimed) == 1
+
+
+class TestPerRouteLimits:
+    """Per-route limits, applied where the route is actually known.
+
+    This lived in the middleware and did not work. Middleware runs above the
+    router, so the template had to be guessed from ``app.routes`` — and FastAPI
+    does not flatten ``include_router``, it wraps it in an opaque object with no
+    ``path``, while a nested route's own ``path`` is relative to its immediate
+    router's prefix rather than the full mount point. The guess resolved routes
+    registered with ``@app.get`` and returned "unmatched" for every route a
+    *feature* mounts, which is every real endpoint.
+
+    So the feature appeared to work — its test used ``@app.get`` — and was inert
+    in production. As a dependency it runs after routing and reads
+    ``scope["route"].path`` directly, which is both correct and free of
+    internals.
+    """
+
+    @staticmethod
+    def _app_with_limited_route() -> FastAPI:
+        from fastapi import APIRouter, Depends, FastAPI
+
+        from app.common.dependencies import rate_limit
+
+        feature = APIRouter(prefix="/invoices")
+
+        @feature.get(
+            "/{invoice_id}",
+            dependencies=[Depends(rate_limit(2, window_seconds=60))],
+        )
+        async def get_invoice(invoice_id: str) -> dict:
+            return {"id": invoice_id}
+
+        version = APIRouter(prefix="/api/v1")
+        version.include_router(feature)
+        app = FastAPI()
+        app.include_router(version)
+        from app.core.exceptions import register_exception_handlers
+
+        register_exception_handlers(app)
+        return app
+
+    @staticmethod
+    async def _client(app: FastAPI) -> AsyncClient:
+        from httpx import ASGITransport, AsyncClient
+
+        return AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://testserver"
+        )
+
+    async def test_the_limit_applies_to_a_deeply_mounted_route(
+        self, live_redis
+    ) -> None:
+        """The exact shape a feature module produces: router into router."""
+        app = self._app_with_limited_route()
+        async with await self._client(app) as client:
+            first = await client.get("/api/v1/invoices/a")
+            second = await client.get("/api/v1/invoices/a")
+            third = await client.get("/api/v1/invoices/a")
+
+        assert first.status_code == 200
+        assert second.status_code == 200
+        assert third.status_code == 429
+
+    async def test_the_refusal_uses_the_standard_envelope(self, live_redis) -> None:
+        """A dependency runs below ExceptionMiddleware, so raising is correct."""
+        app = self._app_with_limited_route()
+        async with await self._client(app) as client:
+            for _ in range(3):
+                response = await client.get("/api/v1/invoices/b")
+
+        assert response.status_code == 429
+        assert response.json()["error"]["code"] == "rate_limited"
+        assert int(response.headers["Retry-After"]) > 0
+
+    async def test_the_limit_is_keyed_by_route_not_only_identity(
+        self, live_redis
+    ) -> None:
+        """Otherwise unrelated traffic exhausts an expensive endpoint's budget.
+
+        The path parameter differs, but the *template* is the same, so both
+        requests must share one bucket — keying by resolved path would mint a
+        bucket per invoice ID and make the limit meaningless.
+        """
+        app = self._app_with_limited_route()
+        async with await self._client(app) as client:
+            await client.get("/api/v1/invoices/x")
+            await client.get("/api/v1/invoices/y")
+            third = await client.get("/api/v1/invoices/z")
+
+        assert third.status_code == 429
+
+    async def test_a_burst_limit_permits_the_whole_bucket_at_once(
+        self, live_redis
+    ) -> None:
+        """For clients that legitimately arrive in waves — a sync on startup."""
+        from fastapi import APIRouter, Depends, FastAPI
+
+        from app.common.dependencies import rate_limit
+        from app.core.exceptions import register_exception_handlers
+
+        router = APIRouter(prefix="/sync")
+
+        @router.get(
+            "/pull",
+            dependencies=[Depends(rate_limit(60, window_seconds=60, burst=5))],
+        )
+        async def pull() -> dict:
+            return {"ok": True}
+
+        app = FastAPI()
+        app.include_router(router)
+        register_exception_handlers(app)
+
+        async with await self._client(app) as client:
+            allowed = [(await client.get("/sync/pull")).status_code for _ in range(5)]
+            refused = await client.get("/sync/pull")
+
+        assert allowed == [200] * 5
+        assert refused.status_code == 429

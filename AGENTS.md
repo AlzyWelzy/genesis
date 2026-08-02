@@ -327,7 +327,27 @@ here: the guarantees under test are *theirs*.
 
 ---
 
-## 9b. The eight dimensions
+## 9a. Contract stability
+
+`tests/contract/` locks the promises made to software this repository cannot
+patch: error `code` values, the error envelope's shape, the status a code maps
+to, the probe paths an orchestrator calls, and the correlation headers a support
+query starts from.
+
+These manifests are **locked values, not derived ones**. Deriving them from the
+code would make the tests tautological — they would pass whatever the code
+happened to say, which is precisely what they must not do.
+
+When one fails, decide deliberately:
+
+* **Adding** a code or field is backwards compatible — add it to the manifest in
+  the same commit.
+* **Renaming or removing** one is a breaking change. Version the API or keep the
+  old name alongside; do not edit the manifest to quiet the test.
+
+---
+
+## 9b. The nine dimensions
 
 Bugs kept appearing across review passes because each pass explored a different
 *dimension of failure*, and a technique is blind to every dimension it does not
@@ -344,6 +364,7 @@ dimensions it touches** rather than only "did I write a test".
 | Dependency failure | `tests/concurrency/test_dependency_failure.py` | Right when Redis or PG is gone? |
 | Configuration | `tests/config` | Is every setting combination safe to deploy? |
 | Time | `tests/property/test_time_properties.py` | Right across boundaries and eras? |
+| Contract stability | `tests/contract` | Can a client still parse this? |
 
 A new setting means a `tests/config` case. A new Redis-backed control means a
 concurrency case *above the pool size*. A new encoder means a property. A new
@@ -368,6 +389,11 @@ Before "fixing" any of these, read the comment next to them:
   fail *silently* in production — uploads land on container-local disk and
   vanish on restart; email is logged instead of sent. Refusing to boot is the
   point: a failed deploy beats a silent breach.
+- **Per-route rate limits are a dependency, not middleware.** Middleware runs
+  above the router, so `scope["route"]` is empty and the template must be
+  guessed from `app.routes` — which FastAPI does not flatten. Use
+  `Depends(rate_limit(...))` on the route. The *global* limit stays in
+  middleware because it must see requests that match no route.
 - **`end_of_day` returns the *next* midnight.** Exclusive on purpose; an
   inclusive `23:59:59` drops the final second. Compare with `<`, never SQL
   `BETWEEN`, which is inclusive at both ends and double-counts midnight.

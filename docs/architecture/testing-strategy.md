@@ -217,6 +217,7 @@ address. The dimensions are finite, so enumerating them is what ends the cycle.
 | 6 | Dependency failure | Correct when Redis or PG is gone? | `test_dependency_failure.py` | 0 |
 | 7 | Configuration | Is every setting combination safe? | `tests/config` | 1 |
 | 8 | Time | Correct across boundaries and eras? | `test_time_properties.py` | 0 |
+| 9 | Contract stability | Can a client still parse this? | `tests/contract` | 1 |
 
 The instructive part is *where* the bugs sat. Dimension 1 found unwired code —
 the outbox relay nothing ran, events nothing delivered. Dimension 3 found code
@@ -240,3 +241,37 @@ Three dimensions remain, and none is closeable by a test suite on a laptop:
 That is the honest boundary. Everything inside it now has a suite that runs on
 every commit; everything outside it needs an environment this repository does not
 have.
+
+
+## Dimension 9: contract stability
+
+Some guarantees are not about behaviour but about *not changing*. An error
+`code` is documented here as "part of the public API contract: adding one is
+safe, changing one is a breaking change" — and nothing enforced it. Renaming
+`not_found` during a refactor would have passed every test, lint and type check,
+then silently broken every client branching on it. The application would be more
+correct by its own tests and less usable by everyone consuming it.
+
+The suite locks: error codes, the envelope's field names, the status each code
+maps to, the `WWW-Authenticate` and `Retry-After` headers, the probe paths, the
+correlation header names, and the API version prefix.
+
+### The bug this dimension surfaced
+
+Locking the probe paths required resolving routes, which exposed that
+`_prerouting_template` — the helper making per-route rate limits work — resolved
+**nothing**. FastAPI does not flatten `include_router` into `app.routes`; it
+inserts an opaque wrapper with no `path`, and a nested route's own `path` is
+relative to its immediate router's prefix rather than the full mount point. So
+the helper resolved routes registered with `@app.get` and returned `"unmatched"`
+for every route a feature module mounts — which is every real endpoint.
+
+The feature had a passing test. That test registered its routes with `@app.get`,
+which is not how any feature mounts a route. **A test that does not reproduce
+production structure verifies nothing.**
+
+The fix was not a better guess. Per-route limiting moved to a router dependency,
+`app.common.dependencies.rate_limit`, which runs *after* routing and reads
+`scope["route"].path` directly — correct, and free of framework internals. That
+is also what `app/core/middleware.py`'s own docstring prescribes: anything
+expressible as a dependency belongs there.

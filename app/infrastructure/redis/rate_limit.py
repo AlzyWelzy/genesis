@@ -207,50 +207,21 @@ async def reset_rate_limit(identity: str) -> None:
         logger.warning("Rate limit reset failed", extra={"identity": identity})
 
 
-@dataclass(frozen=True, slots=True)
-class EndpointLimit:
-    """A rate limit that applies to one route rather than globally.
-
-    The global limit protects the service from a runaway client. It is the
-    wrong instrument for a single expensive endpoint: setting it low enough to
-    protect a report generator would throttle ordinary reads, and setting it
-    high enough for ordinary reads leaves the report generator unprotected.
-
-    Attributes:
-        limit: Requests permitted per window.
-        window_seconds: Sliding window length.
-        burst: When set, uses a token bucket permitting this many requests
-            back-to-back while holding the long-run average to ``limit``.
-    """
-
-    limit: int
-    window_seconds: int = 60
-    burst: int | None = None
-
-
-#: Per-route overrides, keyed by the route *template* — never the resolved
-#: path, or every distinct ID would get its own allowance.
-ENDPOINT_LIMITS: dict[str, EndpointLimit] = {}
-
-
-def register_endpoint_limit(route: str, limit: EndpointLimit) -> None:
-    """Declare a tighter limit for one route.
-
-    Called at import time by the feature that owns the route, so the limit
-    lives next to the expensive endpoint rather than in a distant config file
-    that nobody updates when the endpoint changes.
-    """
-    ENDPOINT_LIMITS[route] = limit
-
-
-def limit_for_route(route: str, *, authenticated: bool) -> EndpointLimit:
-    """Return the limit that applies to a route, falling back to the global one."""
-    if override := ENDPOINT_LIMITS.get(route):
-        return override
-    return EndpointLimit(
-        limit=resolve_limit(authenticated=authenticated),
-        window_seconds=settings.rate_limit.window_seconds,
-    )
+# `EndpointLimit`, `ENDPOINT_LIMITS`, `register_endpoint_limit` and
+# `limit_for_route` used to live here: an import-time registry the rate-limit
+# middleware consulted per request.
+#
+# They are gone because the middleware could never consult them correctly.
+# Middleware runs above the router, so the route template had to be guessed from
+# `app.routes`, and FastAPI does not flatten `include_router` — it inserts an
+# opaque wrapper carrying no `path`, while a nested route's own `path` is
+# relative to its immediate router's prefix rather than the full mount point.
+# Every route a feature mounts resolved to "unmatched".
+#
+# A per-route limit is now declared where the route is: as a dependency,
+# `app.common.dependencies.rate_limit(...)`, which takes its parameters directly
+# and reads `scope["route"].path` after routing. No registry, no lookup, and
+# nothing that can silently fail to match.
 
 
 async def check_token_bucket(

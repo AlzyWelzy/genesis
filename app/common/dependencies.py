@@ -72,7 +72,7 @@ a dependency's clothes. Dependencies resolve, authenticate, authorise and
 construct — nothing else.
 """
 
-from collections.abc import Callable, Coroutine
+from collections.abc import Awaitable, Callable, Coroutine
 from contextlib import suppress
 from typing import Annotated, Any
 from uuid import UUID
@@ -83,8 +83,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.common.constants import BEARER_PREFIX
 from app.common.pagination import PaginationParams
 from app.common.sorting import SortParams
-from app.core.context import tenant_id_var, user_id_var
-from app.core.exceptions import AuthenticationError, AuthorizationError, NotFoundError
+from app.core.context import get_user_id, tenant_id_var, user_id_var
+from app.core.exceptions import (
+    AuthenticationError,
+    AuthorizationError,
+    NotFoundError,
+    RateLimitError,
+)
 from app.core.principal import (
     Principal,
     assert_active,
@@ -96,6 +101,10 @@ from app.core.principal import (
 from app.core.security import ACCESS_TOKEN_TYPE, InvalidTokenError, TokenClaims
 from app.core.security import decode_token as _decode_token
 from app.infrastructure.database.session import get_session
+from app.infrastructure.redis.rate_limit import (
+    check_rate_limit,
+    check_token_bucket,
+)
 
 # ---------------------------------------------------------------------------
 # Infrastructure
@@ -369,3 +378,98 @@ def require_superuser() -> _Guard:
         return principal
 
     return guard
+
+
+def rate_limit(
+    limit: int, *, window_seconds: int = 60, burst: int | None = None
+) -> Callable[[Request], Awaitable[None]]:
+    """Apply a tighter rate limit to one route.
+
+    Why this is a dependency and not middleware
+    -------------------------------------------
+    The global limit protects the service from a runaway client. It is the wrong
+    instrument for a single expensive endpoint: set it low enough to protect a
+    report generator and ordinary reads are throttled; set it high enough for
+    ordinary reads and the report generator is unprotected.
+
+    A per-route limit has to know *which* route it is limiting, and that is
+    precisely what middleware cannot know — middleware runs above the router, so
+    ``scope["route"]`` is still empty. Every attempt to guess the template from
+    ``app.routes`` depends on FastAPI internals that do not hold: an
+    ``include_router`` is not flattened but wrapped in an opaque object with no
+    ``path``, and a nested route's ``path`` is relative to its immediate router's
+    prefix rather than to the full mount point. A version of this that resolved
+    routes registered with ``@app.get`` returned "unmatched" for every route a
+    feature mounts — which is every real endpoint — and was therefore inert while
+    appearing to work.
+
+    As a dependency it runs *after* routing, so the template is simply
+    ``scope["route"].path``, with no internals involved. It also becomes visible
+    in the OpenAPI schema, testable on its own, and costs nothing on the routes
+    that do not use it.
+
+    Usage::
+
+        @router.post(
+            "/reports",
+            dependencies=[Depends(rate_limit(5, window_seconds=60))],
+        )
+        async def generate_report(...): ...
+
+    Args:
+        limit: Requests permitted per window.
+        window_seconds: Length of the window.
+        burst: When set, uses a token bucket permitting this many requests
+            back to back while holding the long-run average to ``limit``. For
+            clients that legitimately arrive in waves — a sync on startup —
+            where a sliding window would have to be set implausibly high.
+
+    Returns:
+        A dependency that raises :class:`~app.core.exceptions.RateLimitError`
+        when the caller is over their allowance.
+    """
+
+    async def guard(request: Request) -> None:
+        # Keyed by identity *and* route. Keying by identity alone would make a
+        # tight limit on one expensive endpoint share a counter with every
+        # ordinary read the same caller makes, so unrelated traffic would
+        # exhaust it and its own allowance would eat everyone else's.
+        route = getattr(request.scope.get("route"), "path", request.url.path)
+        user_id = get_user_id()
+        identity = f"user:{user_id}" if user_id else _client_identity(request)
+        key = f"{identity}:{route}"
+
+        if burst is None:
+            result = await check_rate_limit(
+                key, limit=limit, window_seconds=window_seconds
+            )
+        else:
+            result = await check_token_bucket(
+                key,
+                rate=limit / window_seconds,
+                burst=burst,
+                window_seconds=window_seconds,
+            )
+
+        if not result.allowed:
+            # Raised, not returned. Unlike the middleware, a dependency runs
+            # *below* `ExceptionMiddleware`, so the handler turns this into the
+            # standard 429 envelope.
+            raise RateLimitError(retry_after=result.reset_after)
+
+    return guard
+
+
+def _client_identity(request: Request) -> str:
+    """Identify an unauthenticated caller for rate-limiting purposes.
+
+    The left-most ``X-Forwarded-For`` entry is the original client; the rest are
+    proxy hops. Trusted only because a proxy and ``TrustedHostMiddleware`` sit in
+    front — the header is client-controlled and must not be believed by a
+    directly exposed app.
+    """
+    forwarded = request.headers.get("X-Forwarded-For", "")
+    client_ip = forwarded.split(",")[0].strip() or (
+        request.client.host if request.client else "unknown"
+    )
+    return f"ip:{client_ip}"

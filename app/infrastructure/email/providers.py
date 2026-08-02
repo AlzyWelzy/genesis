@@ -328,18 +328,38 @@ class CollectingEmailProvider:
 
     For tests. Lets an assertion check that a message *would* have been sent,
     and to whom, with no transport and no rendering side effects to mock.
+
+    **Applies suppression and idempotency, exactly as a real transport does.**
+    Those two are not transport concerns — they decide whether a message is sent
+    at all — so a fake that skipped them would let a test assert that mail went
+    to an address production refuses, or that a retried job sent once when it
+    would have sent twice.
+
+    This fake is installed by an autouse fixture, so it is what nearly every
+    test in the suite actually exercises. It previously appended
+    unconditionally, which made both guarantees untestable rather than merely
+    untested: the assertion that would have proved them could not pass. See
+    ``tests/parity``.
+
+    Rendering is still skipped, deliberately and visibly: a captured message is
+    kept as the ``EmailMessage`` it was, so an assertion can inspect the template
+    name and context rather than parsing HTML.
     """
 
     def __init__(self) -> None:
         self.sent: list[EmailMessage] = []
 
     async def send(self, message: EmailMessage) -> None:
-        """Record the message."""
-        self.sent.append(message)
+        """Record the message, if suppression and idempotency permit it."""
+        prepared = await prepare_recipients(message)
+        if prepared is None or not await claim_send(prepared):
+            return
+        self.sent.append(prepared)
 
     async def send_batch(self, messages: list[EmailMessage]) -> None:
-        """Record every message."""
-        self.sent.extend(messages)
+        """Record each message that passes the same guards."""
+        for message in messages:
+            await self.send(message)
 
     def clear(self) -> None:
         """Discard captured messages. For test teardown."""

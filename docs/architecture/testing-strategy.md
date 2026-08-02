@@ -218,6 +218,7 @@ address. The dimensions are finite, so enumerating them is what ends the cycle.
 | 7 | Configuration | Is every setting combination safe? | `tests/config` | 1 |
 | 8 | Time | Correct across boundaries and eras? | `test_time_properties.py` | 0 |
 | 9 | Contract stability | Can a client still parse this? | `tests/contract` | 1 |
+| 10 | Double parity | Does the fake behave like the real thing? | `tests/parity` | 2 |
 
 The instructive part is *where* the bugs sat. Dimension 1 found unwired code —
 the outbox relay nothing ran, events nothing delivered. Dimension 3 found code
@@ -275,3 +276,40 @@ The fix was not a better guess. Per-route limiting moved to a router dependency,
 `scope["route"].path` directly — correct, and free of framework internals. That
 is also what `app/core/middleware.py`'s own docstring prescribes: anything
 expressible as a dependency belongs there.
+
+
+## Dimension 10: test-double parity
+
+`conftest.py` installs `InMemoryCache`, `InMemoryQueue` and
+`CollectingEmailProvider` with autouse fixtures, so nearly every test in this
+suite exercises a fake rather than the implementation that runs in production.
+That is deliberate and correct. It also has one failure mode that nothing else
+can reach.
+
+**A fake more permissive than the real thing makes the guarantee it diverges on
+untestable.** The distinction from "untested" matters: an untested guarantee can
+be tested tomorrow, whereas here the test that would prove it *cannot pass*, so
+the assertion gets deleted and the guarantee silently stops existing.
+
+Two had shipped:
+
+| Fake | Divergence | Consequence |
+|---|---|---|
+| `InMemoryQueue` | Ignored `idempotency_key` entirely | 3 jobs against the fake, 1 against Redis. Deduplication was unobservable in any unit test. |
+| `CollectingEmailProvider` | No suppression, no idempotency | A test could assert mail was sent to an address production refuses, or that a retry sent once when it would send twice. |
+
+Fixing the queue exposed a second defect in the real implementation: a suppressed
+`enqueue` returned a freshly minted ID for a job that was never queued, so
+cancelling it silently did nothing and storing it against a business record
+pointed at nothing. Both now return the winner's ID.
+
+### The generalisation
+
+This is the same lesson as the route-resolution bug in dimension 9, in a
+different costume: **a test that does not reproduce production structure verifies
+nothing.** Once it was a route registered with `@app.get` instead of
+`include_router`. Once it was a queue that was not really a queue.
+
+The defence is to state the behaviour *once* and assert both implementations
+agree — never to hard-code the expectation in two places, because two copies
+drift and the drift is the bug.

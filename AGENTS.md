@@ -347,7 +347,33 @@ When one fails, decide deliberately:
 
 ---
 
-## 9b. The nine dimensions
+## 9a2. Test-double parity
+
+`tests/parity/` holds every fake to its real implementation's behaviour.
+
+`conftest.py` installs `InMemoryCache`, `InMemoryQueue` and
+`CollectingEmailProvider` with **autouse** fixtures, so nearly every test in the
+suite exercises the fake, not the thing that runs in production. That is the
+right design — a test reaching a real external system is a monitoring check with
+a misleading name — and it has exactly one failure mode.
+
+**A fake that is more permissive than the real implementation makes the
+guarantee it diverges on untestable.** Not untested: *untestable*. The test that
+would prove the behaviour cannot pass, so whoever writes it deletes the
+assertion, and the guarantee quietly stops being one.
+
+Two shipped that way. `InMemoryQueue` ignored `idempotency_key` entirely — three
+jobs against the fake, one against Redis. `CollectingEmailProvider` applied
+neither suppression nor idempotency, so a test could assert mail went to an
+address production refuses.
+
+**When you add or change a fake, add a parity test.** State the behaviour once
+and assert both implementations agree — never hard-code the expectation twice,
+or the two copies drift and the divergence reappears.
+
+---
+
+## 9b. The ten dimensions
 
 Bugs kept appearing across review passes because each pass explored a different
 *dimension of failure*, and a technique is blind to every dimension it does not
@@ -365,6 +391,7 @@ dimensions it touches** rather than only "did I write a test".
 | Configuration | `tests/config` | Is every setting combination safe to deploy? |
 | Time | `tests/property/test_time_properties.py` | Right across boundaries and eras? |
 | Contract stability | `tests/contract` | Can a client still parse this? |
+| Double parity | `tests/parity` | Does the fake behave like the real thing? |
 
 A new setting means a `tests/config` case. A new Redis-backed control means a
 concurrency case *above the pool size*. A new encoder means a property. A new

@@ -207,7 +207,14 @@ class RedisQueue:
                         "idempotency_key": job.idempotency_key,
                     },
                 )
-                return job_id
+                # The *winner's* ID, not the one just minted. Returning the
+                # fresh ID hands back an identifier for a job that was never
+                # enqueued: cancelling it silently does nothing, and storing it
+                # against a business record points at nothing that exists.
+                # The claim's value is the winner's ID precisely so this is
+                # answerable.
+                winner = await client.get(build_key("jobs:idem", job.idempotency_key))
+                return _as_text(winner) if winner else job_id
 
         if job.delay:
             due = (utc_now() + job.delay).timestamp()
@@ -319,13 +326,46 @@ class InMemoryQueue:
 
     For tests: lets an assertion check that a job *would* have been enqueued,
     with what payload, and without Redis running.
+
+    **It must behave like :class:`RedisQueue` wherever behaviour is observable.**
+    This fake is installed by an autouse fixture, so it is what essentially every
+    test in the suite actually exercises. A fake that is more permissive than the
+    real implementation does not merely fail to catch a bug — it makes the
+    guarantee untestable, because the test that would prove it cannot pass.
+
+    That happened here: idempotency was not implemented at all, so enqueueing the
+    same key three times produced three jobs against the fake and one against
+    Redis. Any code depending on that guarantee would have been "verified" by
+    tests that could not observe it. See ``tests/parity``.
     """
 
     def __init__(self) -> None:
         self.jobs: list[Job] = []
+        #: Idempotency key to the ID of the job that claimed it, mirroring the
+        #: ``SET NX`` in :meth:`RedisQueue.enqueue`.
+        self._claimed: dict[str, str] = {}
 
     async def enqueue(self, job: Job) -> str:
-        """Record the job."""
+        """Record the job, honouring ``idempotency_key`` as Redis does.
+
+        Returns the *winning* job's ID when a duplicate is suppressed, so the
+        caller holds an identifier for a job that actually exists.
+        """
+        if job.idempotency_key:
+            if claimed := self._claimed.get(job.idempotency_key):
+                logger.info(
+                    "Duplicate job suppressed",
+                    extra={
+                        "job_name": job.name,
+                        "idempotency_key": job.idempotency_key,
+                    },
+                )
+                return claimed
+            job_id = uuid7().hex
+            self._claimed[job.idempotency_key] = job_id
+            self.jobs.append(job)
+            return job_id
+
         self.jobs.append(job)
         return uuid7().hex
 
@@ -338,8 +378,9 @@ class InMemoryQueue:
         return False
 
     def clear(self) -> None:
-        """Discard recorded jobs. For test teardown."""
+        """Discard recorded jobs and idempotency claims. For test teardown."""
         self.jobs.clear()
+        self._claimed.clear()
 
 
 #: Process-wide registry. Task modules import this and decorate their handlers.
